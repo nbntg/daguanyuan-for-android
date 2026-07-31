@@ -1083,8 +1083,17 @@ void main() {
     expect(find.text('大章节'), findsOneWidget);
     expect(find.text('小章节'), findsOneWidget);
     expect(find.text('具体内容'), findsOneWidget);
-    expect(find.text('题号 #1'), findsOneWidget);
-    expect(find.text('#1 · 1988 数一二'), findsOneWidget);
+    final firstQuestionLabel = tester.widget<Text>(
+      find.byKey(const ValueKey('canvas-question-choice-1')),
+    );
+    expect(firstQuestionLabel.data, '#1 · 1988 数一二');
+    expect(find.text('题号 #1'), findsNothing);
+    expect(
+      find.text(
+        r'已知 $f(x)=e^{x^2}$，$f(\varphi(x))=1-x$，且 $\varphi(x)\ge0$，求 $\varphi(x)$ 并写出它的定义域。',
+      ),
+      findsNothing,
+    );
     expect(find.text('题号 #12'), findsNothing);
     controller.dispose();
   });

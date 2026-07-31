@@ -51,7 +51,7 @@ flutter build apk --release
 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-Windows 用户也可以双击 `构建APK.cmd`，脚本会执行检查并生成 `daguan-math-community-v1.0.9.apk`。
+Windows 用户也可以双击 `构建APK.cmd`，脚本会执行检查并生成 `daguan-math-community-v1.1.0.apk`。
 
 ### APK 签名说明
 

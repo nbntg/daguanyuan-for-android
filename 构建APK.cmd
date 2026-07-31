@@ -36,11 +36,11 @@ call flutter build apk --release
 if errorlevel 1 goto failed
 
 if not exist "build\app\outputs\flutter-apk\app-release.apk" goto failed
-copy /y "build\app\outputs\flutter-apk\app-release.apk" "%~dp0daguan-math-community-v1.0.9.apk" >nul
+copy /y "build\app\outputs\flutter-apk\app-release.apk" "%~dp0daguan-math-community-v1.1.0.apk" >nul
 
 echo.
 echo Build complete:
-echo %~dp0daguan-math-community-v1.0.9.apk
+echo %~dp0daguan-math-community-v1.1.0.apk
 echo.
 pause
 exit /b 0

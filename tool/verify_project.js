@@ -106,6 +106,46 @@ const manifest = fs.readFileSync(
 );
 check(!manifest.includes("android.permission.INTERNET"), "应用不应申请联网权限");
 check(!manifest.toLowerCase().includes("webview"), "应用不应使用 WebView");
+check(
+  manifest.includes('android:allowBackup="false"'),
+  "应用必须关闭系统自动备份和恢复",
+);
+check(
+  manifest.includes('android:fullBackupContent="@xml/backup_rules"'),
+  "Android 11 及以下必须配置备份排除规则",
+);
+check(
+  manifest.includes('android:dataExtractionRules="@xml/data_extraction_rules"'),
+  "Android 12 及以上必须配置数据迁移排除规则",
+);
+const backupRules = fs.readFileSync(
+  path.join(appRoot, "android", "app", "src", "main", "res", "xml", "backup_rules.xml"),
+  "utf8",
+);
+const extractionRules = fs.readFileSync(
+  path.join(
+    appRoot,
+    "android",
+    "app",
+    "src",
+    "main",
+    "res",
+    "xml",
+    "data_extraction_rules.xml",
+  ),
+  "utf8",
+);
+check(
+  backupRules.includes('<exclude domain="file" path="."'),
+  "旧版 Android 备份规则必须排除应用文件",
+);
+check(
+  extractionRules.includes("<cloud-backup>")
+    && extractionRules.includes("<device-transfer>")
+    && (extractionRules.match(/<exclude domain="file" path="."\s*\/>/g) || [])
+      .length === 2,
+  "Android 12+ 必须同时排除云备份与设备迁移中的应用文件",
+);
 
 const dartFiles = fs
   .readdirSync(path.join(appRoot, "lib"))

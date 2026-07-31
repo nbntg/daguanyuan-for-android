@@ -2568,7 +2568,7 @@ class _CanvasQuestionPickerSheetState
           child: TextField(
             decoration: const InputDecoration(
               prefixIcon: Icon(Icons.search_rounded),
-              hintText: '搜索当前范围内的题号或内容',
+              hintText: '搜索当前范围内的序号或来源',
             ),
             onChanged: (value) => setState(() => query = value),
           ),
@@ -2611,6 +2611,13 @@ class _CanvasQuestionPickerSheetState
                   ),
                   itemBuilder: (context, index) {
                     final question = questions[index];
+                    final navigationBook = widget.controller.navigationBook;
+                    final displayPosition =
+                        fixedSequence && navigationBook != null
+                            ? widget.controller
+                                .originFor(question, navigationBook)
+                                ?.position
+                            : index + 1;
                     final selected =
                         widget.controller.selectedQuestionId == question.id;
                     return ListTile(
@@ -2620,13 +2627,12 @@ class _CanvasQuestionPickerSheetState
                         mastery: widget.controller.stateOf(question.id).mastery,
                       ),
                       title: Text(
-                        '题号 #${question.serial}',
+                        '${displayPosition == null ? '#—' : '#$displayPosition'} · '
+                        '${_sourceLabel(question.source)}',
+                        key: ValueKey(
+                          'canvas-question-choice-${question.id}',
+                        ),
                         style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      subtitle: Text(
-                        question.stem.replaceAll(RegExp(r'\s+'), ' ').trim(),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
                       ),
                       trailing: const Icon(Icons.chevron_right_rounded),
                       onTap: () => Navigator.pop(
