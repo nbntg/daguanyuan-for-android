@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:daguan_math/handwriting_canvas.dart';
 import 'package:daguan_math/handwriting_models.dart';
@@ -324,8 +325,9 @@ void main() {
         find.byKey(const ValueKey('handwriting-ink-layer')),
       );
       final dynamic liveErasePainter = liveEraseLayer.painter;
-      expect((liveErasePainter.strokes as List), hasLength(2));
-      expect((liveErasePainter.strokes as List).last.erase, isTrue);
+      expect((liveErasePainter.strokes as List), hasLength(1));
+      expect((liveErasePainter.overlayStrokes as List), hasLength(1));
+      expect((liveErasePainter.overlayStrokes as List).last.erase, isTrue);
       await buttonGesture.up();
       await tester.pump();
       final buttonInkLayer = tester.widget<CustomPaint>(
@@ -388,6 +390,35 @@ void main() {
       final dynamic finalInkPainter = finalInkLayer.painter;
       expect((finalInkPainter.strokes as List), hasLength(3));
       expect((finalInkPainter.strokes as List).last.erase, isFalse);
+      final firstRecorder = ui.PictureRecorder();
+      finalInkPainter.paint(
+        Canvas(firstRecorder),
+        const Size(800, 600),
+      );
+      firstRecorder.endRecording().dispose();
+      final cacheBuildCount = finalInkPainter.cacheBuildCount as int;
+      final secondRecorder = ui.PictureRecorder();
+      finalInkPainter.paint(
+        Canvas(secondRecorder),
+        const Size(800, 600),
+      );
+      secondRecorder.endRecording().dispose();
+      expect(finalInkPainter.cacheBuildCount, cacheBuildCount);
+
+      final reloadCanvas = tester
+          .widget<IconButton>(find.byKey(const ValueKey('canvas-reload')))
+          .onPressed!;
+      await tester.runAsync(() async {
+        reloadCanvas();
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('画布已重新载入，书写内容完整保留'), findsOneWidget);
+      final reloadedInkLayer = tester.widget<CustomPaint>(
+        find.byKey(const ValueKey('handwriting-ink-layer')),
+      );
+      final dynamic reloadedInkPainter = reloadedInkLayer.painter;
+      expect((reloadedInkPainter.strokes as List), hasLength(3));
 
       await tester.tap(find.byKey(const ValueKey('canvas-reset-current')));
       await tester.pumpAndSettle();
@@ -530,6 +561,156 @@ void main() {
       expect(restored!.analysisCard.x, 240);
       expect(restored.analysisCard.y, 1400);
       expect(restored.viewScale, .75);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+    } finally {
+      messenger.setMockMethodCallHandler(
+        const MethodChannel('daguan.local/storage'),
+        null,
+      );
+      if (directory.existsSync()) {
+        await tester.runAsync(() async {
+          for (var attempt = 0; attempt < 6; attempt++) {
+            try {
+              await directory.delete(recursive: true);
+              return;
+            } on PathAccessException {
+              await Future<void>.delayed(const Duration(milliseconds: 100));
+            }
+          }
+        });
+      }
+    }
+  });
+
+  test('超长解析的导出边界不受固定高度上限截断并优先采用实测高度', () {
+    final question = Question.fromJson({
+      'id': 1412,
+      'serial': 1023,
+      'categoryIds': [406],
+      'stem': '测试题干',
+      'options': <String>[],
+      'answer': 'A',
+      'explanation': List.filled(1300, '长').join(),
+      'source': '测试题',
+    });
+    final document = HandwritingDocument.empty(question.id);
+
+    final estimated = handwritingExportContentBounds(
+      document,
+      question,
+      analysisVisible: true,
+      includeTextNote: false,
+    );
+    final measured = handwritingExportContentBounds(
+      document,
+      question,
+      analysisVisible: true,
+      includeTextNote: false,
+      cardHeights: const {'analysis': 2400},
+    );
+
+    expect(estimated.bottom, greaterThan(2800));
+    expect(measured.bottom, 3208);
+  });
+
+  testWidgets('打开超长解析时按真实卡片高度缩小并完整聚焦', (tester) async {
+    final directory =
+        Directory.systemTemp.createTempSync('daguan-long-analysis-test-');
+    File(
+      '${directory.path}${Platform.pathSeparator}progress.json',
+    ).writeAsStringSync('{"states":{},"events":[]}');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(
+      const MethodChannel('daguan.local/storage'),
+      (call) async {
+        if (call.method == 'getFilesDir') return directory.path;
+        throw PlatformException(code: 'unknown_method');
+      },
+    );
+
+    try {
+      final storage = LocalStorage();
+      await tester.runAsync(storage.loadProgress);
+      final root = jsonDecode(File('assets/questions.json').readAsStringSync())
+          as Map<String, dynamic>;
+      final rawQuestion = (root['items'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()
+          .singleWhere((item) => item['id'] == 1412);
+      final question = Question.fromJson(rawQuestion);
+      final saved = HandwritingDocument.empty(question.id)
+        ..analysisCard = const CanvasCardState(x: 240, y: 1400, width: 720)
+        ..viewOffset = const Offset(18, 20)
+        ..viewScale = .75;
+      await tester.runAsync(() => storage.saveHandwriting(saved));
+
+      tester.view
+        ..physicalSize = const Size(800, 600)
+        ..devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: HandwritingCanvasPage(
+            storage: storage,
+            initialContext: HandwritingQuestionContext(
+              question: question,
+              categoryPath: '高等数学 / 一元微分',
+              textNote: '',
+              displayPosition: 13,
+              index: 12,
+              total: 23,
+              state: QuestionState(),
+              correctOptionIndexes: const {0},
+            ),
+            onNavigate: (_) => null,
+            onOpenNavigator: (_) => null,
+            onTextNoteChanged: (_, __) {},
+            onToggleFavorite: (_) {},
+            onSetMastery: (_, __) {},
+            onSubmitAnswer: (_, __) {},
+            onClearAnswer: (_) {},
+          ),
+        ),
+      );
+      await tester.pump();
+      for (var attempt = 0; attempt < 10; attempt++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 80)),
+        );
+        await tester.pump();
+        if (find.byType(CircularProgressIndicator).evaluate().isEmpty) break;
+      }
+
+      tester
+          .widget<IconButton>(
+            find.widgetWithIcon(
+              IconButton,
+              Icons.lightbulb_outline_rounded,
+            ),
+          )
+          .onPressed!();
+      await tester.pump();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 320));
+
+      final analysisCard = find
+          .ancestor(
+            of: find.text('答案与解析'),
+            matching: find.byType(Container),
+          )
+          .first;
+      final cardBox = tester.renderObject<RenderBox>(analysisCard);
+      final cardRect = Rect.fromPoints(
+        cardBox.localToGlobal(Offset.zero),
+        cardBox.localToGlobal(cardBox.size.bottomRight(Offset.zero)),
+      );
+      expect(cardRect.top, greaterThanOrEqualTo(0));
+      expect(cardRect.bottom, lessThanOrEqualTo(600));
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump();

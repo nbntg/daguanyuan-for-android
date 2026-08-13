@@ -48,6 +48,9 @@ class _SyncStateChange {
     required this.hasFavorite,
     required this.favorite,
     this.updatedAt,
+    this.practiceQueuedAt,
+    this.reviewAddedAt,
+    this.reviewOrigin,
   });
 
   final int questionId;
@@ -56,6 +59,9 @@ class _SyncStateChange {
   final bool hasFavorite;
   final bool favorite;
   final String? updatedAt;
+  final String? practiceQueuedAt;
+  final String? reviewAddedAt;
+  final CollectionOrigin? reviewOrigin;
 }
 
 class DaguanApp extends StatefulWidget {
@@ -124,11 +130,18 @@ class _DaguanAppState extends State<DaguanApp> {
   }
 }
 
-enum QuestionBook { favorite, review }
+enum QuestionBook { favorite, recentPractice, review }
 
 enum ReviewFilter { all, needsPractice, notKnown }
 
+enum ReviewSort { ascending, descending }
+
 class AppController extends ChangeNotifier {
+  AppController({DateTime Function()? clock}) : _clock = clock ?? DateTime.now;
+
+  static const progressVersion = 2;
+  static const recentPracticeDuration = Duration(hours: 48);
+
   final storage = LocalStorage();
   final questions = <Question>[];
   final categories = <Category>[];
@@ -144,10 +157,13 @@ class AppController extends ChangeNotifier {
   String search = '';
   bool coreOnly = false;
   ReviewFilter reviewFilter = ReviewFilter.all;
+  ReviewSort reviewSort = ReviewSort.ascending;
   int workspacePage = 0;
   bool canvasOpen = false;
   bool _resumeCanvasPending = false;
   Timer? _saveTimer;
+  Timer? _practiceTimer;
+  final DateTime Function() _clock;
   List<Question>? _navigationQuestions;
   String? _navigationTitle;
   QuestionBook? _navigationBook;
@@ -161,12 +177,14 @@ class AppController extends ChangeNotifier {
       ]);
       final questionData = decodeObject(raw[0] as String);
       questions.addAll(
-        (questionData['items'] as List)
-            .map((item) => Question.fromJson(item as Map<String, dynamic>)),
+        (questionData['items'] as List).map(
+          (item) => Question.fromJson(item as Map<String, dynamic>),
+        ),
       );
       categories.addAll(
-        (decodeObject(raw[1] as String)['items'] as List)
-            .map((item) => Category.fromJson(item as Map<String, dynamic>)),
+        (decodeObject(raw[1] as String)['items'] as List).map(
+          (item) => Category.fromJson(item as Map<String, dynamic>),
+        ),
       );
       for (final category in categories) {
         categoryById[category.id] = category;
@@ -178,19 +196,39 @@ class AppController extends ChangeNotifier {
         }
       }
       final progress = raw[2] as Map<String, dynamic>;
+      final storedVersion = progress['version'] as int? ?? 1;
+      var migratedLegacyPractice = false;
+      final loadedAt = _clock();
       for (final entry
           in (progress['states'] as Map<String, dynamic>? ?? {}).entries) {
-        final state =
-            QuestionState.fromJson(entry.value as Map<String, dynamic>);
+        final state = QuestionState.fromJson(
+          entry.value as Map<String, dynamic>,
+        );
         if (state.inWrongBook && state.mastery == Mastery.notStarted) {
           state.mastery = Mastery.needsPractice;
         }
         state.inWrongBook = false;
+        if (storedVersion < progressVersion &&
+            state.mastery == Mastery.needsPractice) {
+          state
+            ..mastery = Mastery.notStarted
+            ..selectedOptions = []
+            ..lastCorrect = null
+            ..wrongCount = 0
+            ..lastAttemptAt = null
+            ..reviewOrigin = null
+            ..practiceQueuedAt = null
+            ..reviewAddedAt = null;
+          migratedLegacyPractice = true;
+        } else {
+          _normalizePracticeDates(state, loadedAt);
+        }
         states[int.parse(entry.key)] = state;
       }
       events.addAll(
-        (progress['events'] as List? ?? const [])
-            .map((item) => StudyEvent.fromJson(item as Map<String, dynamic>)),
+        (progress['events'] as List? ?? const []).map(
+          (item) => StudyEvent.fromJson(item as Map<String, dynamic>),
+        ),
       );
       final lastStudy = progress['lastStudy'] as Map?;
       final lastQuestionId = lastStudy?['last_question_id'] as int?;
@@ -203,10 +241,22 @@ class AppController extends ChangeNotifier {
           lastCategoryId == null || categoryById.containsKey(lastCategoryId)
               ? lastCategoryId
               : null;
-      workspacePage = (lastStudy?['workspace_page'] as int? ?? 0).clamp(0, 2);
+      final storedWorkspacePage =
+          (lastStudy?['workspace_page'] as int? ?? 0).clamp(0, 5);
+      workspacePage =
+          storedVersion < progressVersion && storedWorkspacePage >= 2
+              ? (storedWorkspacePage + 1).clamp(0, 5)
+              : storedWorkspacePage;
+      if (migratedLegacyPractice && storedWorkspacePage == 2) {
+        workspacePage = 0;
+      }
       reviewFilter = ReviewFilter.values.firstWhere(
         (filter) => filter.name == lastStudy?['review_filter'],
         orElse: () => ReviewFilter.all,
+      );
+      reviewSort = ReviewSort.values.firstWhere(
+        (sort) => sort.name == lastStudy?['review_sort'],
+        orElse: () => ReviewSort.ascending,
       );
       canvasOpen = lastStudy?['canvas_open'] as bool? ?? false;
       if (workspacePage == 1) {
@@ -214,10 +264,17 @@ class AppController extends ChangeNotifier {
         _navigationTitle = '收藏题目';
         _navigationQuestions = List<Question>.unmodifiable(favoriteQuestions);
       } else if (workspacePage == 2) {
+        _navigationBook = QuestionBook.recentPractice;
+        _navigationTitle = '近期复习';
+        _navigationQuestions = List<Question>.unmodifiable(
+          recentPracticeQuestions,
+        );
+      } else if (workspacePage == 3) {
         _navigationBook = QuestionBook.review;
         _navigationTitle = '复习题目';
-        _navigationQuestions =
-            List<Question>.unmodifiable(filteredReviewQuestions);
+        _navigationQuestions = List<Question>.unmodifiable(
+          filteredReviewQuestions,
+        );
       }
       if (_navigationQuestions != null &&
           !_navigationQuestions!.any(
@@ -227,6 +284,14 @@ class AppController extends ChangeNotifier {
       }
       _resumeCanvasPending = canvasOpen && selectedQuestionId != null;
       ready = true;
+      _practiceTimer?.cancel();
+      _practiceTimer = Timer.periodic(
+        const Duration(minutes: 1),
+        (_) => _handlePracticeTick(),
+      );
+      if (migratedLegacyPractice || storedVersion < progressVersion) {
+        await storage.save(exportValue());
+      }
     } catch (exception) {
       error = exception.toString();
     }
@@ -235,6 +300,44 @@ class AppController extends ChangeNotifier {
 
   QuestionState stateOf(int questionId) =>
       states.putIfAbsent(questionId, QuestionState.new);
+
+  DateTime? _date(String? value) =>
+      value == null ? null : DateTime.tryParse(value)?.toLocal();
+
+  void _normalizePracticeDates(QuestionState state, DateTime now) {
+    switch (state.mastery) {
+      case Mastery.needsPractice:
+        final queuedAt = _date(state.practiceQueuedAt);
+        if (queuedAt == null) {
+          state
+            ..practiceQueuedAt = null
+            ..reviewAddedAt ??= now.toIso8601String();
+        } else {
+          state.reviewAddedAt ??=
+              queuedAt.add(recentPracticeDuration).toIso8601String();
+        }
+      case Mastery.notKnown:
+        state
+          ..practiceQueuedAt = null
+          ..reviewAddedAt ??= now.toIso8601String();
+      case Mastery.notStarted || Mastery.mastered:
+        state
+          ..practiceQueuedAt = null
+          ..reviewAddedAt = null;
+    }
+  }
+
+  bool isRecentPracticeState(QuestionState state, {DateTime? now}) {
+    if (state.mastery != Mastery.needsPractice) return false;
+    final queuedAt = _date(state.practiceQueuedAt);
+    if (queuedAt == null) return false;
+    return (now ?? _clock()).isBefore(queuedAt.add(recentPracticeDuration));
+  }
+
+  bool isReviewState(QuestionState state, {DateTime? now}) =>
+      state.mastery == Mastery.notKnown ||
+      (state.mastery == Mastery.needsPractice &&
+          !isRecentPracticeState(state, now: now));
 
   Question? get selectedQuestion {
     final id = selectedQuestionId;
@@ -264,10 +367,57 @@ class AppController extends ChangeNotifier {
       .where((question) => states[question.id]?.favorite ?? false)
       .toList(growable: false);
 
-  List<Question> get reviewQuestions => questions.where((question) {
-        final mastery = states[question.id]?.mastery ?? Mastery.notStarted;
-        return mastery == Mastery.needsPractice || mastery == Mastery.notKnown;
-      }).toList(growable: false);
+  List<Question> get recentPracticeQuestions {
+    final now = _clock();
+    final result = questions
+        .where(
+          (question) => isRecentPracticeState(
+            states[question.id] ?? QuestionState(),
+            now: now,
+          ),
+        )
+        .toList(growable: false);
+    result.sort(
+      (left, right) => _date(
+        stateOf(left.id).practiceQueuedAt,
+      )!
+          .compareTo(_date(stateOf(right.id).practiceQueuedAt)!),
+    );
+    return result;
+  }
+
+  int get recentPracticeCount => recentPracticeQuestions.length;
+
+  String recentPracticeCountdown(Question question) {
+    final queuedAt = _date(stateOf(question.id).practiceQueuedAt);
+    if (queuedAt == null) return '即将移入复习本';
+    final remaining = queuedAt.add(recentPracticeDuration).difference(_clock());
+    if (remaining <= const Duration(hours: 1)) return '即将移入复习本';
+    final days = remaining.inDays;
+    final hours = remaining.inHours.remainder(24);
+    if (days > 0 && hours > 0) return '$days 天 $hours 小时后移入复习本';
+    if (days > 0) return '$days 天后移入复习本';
+    return '${remaining.inHours} 小时后移入复习本';
+  }
+
+  List<Question> get reviewQuestions {
+    final now = _clock();
+    final result = questions
+        .where(
+          (question) =>
+              isReviewState(states[question.id] ?? QuestionState(), now: now),
+        )
+        .toList(growable: false);
+    result.sort((left, right) {
+      final leftAt = _date(stateOf(left.id).reviewAddedAt) ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+      final rightAt = _date(stateOf(right.id).reviewAddedAt) ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+      final comparison = leftAt.compareTo(rightAt);
+      return reviewSort == ReviewSort.ascending ? comparison : -comparison;
+    });
+    return result;
+  }
 
   List<Question> get filteredReviewQuestions => reviewQuestions
       .where(
@@ -470,6 +620,15 @@ class AppController extends ChangeNotifier {
   void selectAdjacent(int offset) {
     final questions = currentQuestionSequence;
     final index = selectedQuestionIndex(questions);
+    if (index < 0 &&
+        _navigationBook == QuestionBook.recentPractice &&
+        questions.isNotEmpty) {
+      chooseQuestion(
+        offset < 0 ? questions.last.id : questions.first.id,
+        keepNavigationContext: true,
+      );
+      return;
+    }
     final next = index + offset;
     if (index < 0 || next < 0 || next >= questions.length) return;
     chooseQuestion(questions[next].id, keepNavigationContext: true);
@@ -494,6 +653,7 @@ class AppController extends ChangeNotifier {
     final state = stateOf(question.id);
     return switch (book) {
       QuestionBook.favorite => state.favoriteOrigin,
+      QuestionBook.recentPractice => state.reviewOrigin,
       QuestionBook.review => state.reviewOrigin,
     };
   }
@@ -554,8 +714,18 @@ class AppController extends ChangeNotifier {
     _scheduleSave();
   }
 
+  void setReviewSort(ReviewSort value) {
+    if (reviewSort == value) return;
+    reviewSort = value;
+    if (_navigationBook == QuestionBook.review) {
+      _replaceReviewNavigation(preferredIndex: 0);
+    }
+    notifyListeners();
+    _scheduleSave();
+  }
+
   void setWorkspacePage(int value) {
-    workspacePage = value >= 0 && value <= 2 ? value : 0;
+    workspacePage = value >= 0 && value <= 5 ? value : 0;
     _scheduleSave();
   }
 
@@ -580,6 +750,7 @@ class AppController extends ChangeNotifier {
     search = '';
     coreOnly = false;
     reviewFilter = ReviewFilter.all;
+    reviewSort = ReviewSort.ascending;
     workspacePage = 0;
     canvasOpen = false;
     _resumeCanvasPending = false;
@@ -592,9 +763,7 @@ class AppController extends ChangeNotifier {
   void _replaceReviewNavigation({required int preferredIndex}) {
     final nextQuestions = filteredReviewQuestions;
     _navigationQuestions = List<Question>.unmodifiable(nextQuestions);
-    if (nextQuestions.any(
-      (question) => question.id == selectedQuestionId,
-    )) {
+    if (nextQuestions.any((question) => question.id == selectedQuestionId)) {
       return;
     }
     selectedQuestionId = nextQuestions.isEmpty
@@ -610,6 +779,7 @@ class AppController extends ChangeNotifier {
         current.indexWhere((item) => item.id == question.id).clamp(0, 1 << 31);
     final nextQuestions = switch (book) {
       QuestionBook.favorite => favoriteQuestions,
+      QuestionBook.recentPractice => recentPracticeQuestions,
       QuestionBook.review => filteredReviewQuestions,
     };
     _navigationQuestions = List<Question>.unmodifiable(nextQuestions);
@@ -619,33 +789,67 @@ class AppController extends ChangeNotifier {
         : nextQuestions[previousIndex.clamp(0, nextQuestions.length - 1)].id;
   }
 
+  void _handlePracticeTick() {
+    if (_navigationBook == QuestionBook.recentPractice) {
+      _navigationQuestions = List<Question>.unmodifiable(
+        recentPracticeQuestions,
+      );
+    }
+    notifyListeners();
+  }
+
+  void _clearReviewPlacement(QuestionState state) {
+    state
+      ..practiceQueuedAt = null
+      ..reviewAddedAt = null
+      ..reviewOrigin = null;
+  }
+
+  void _queueForPractice(Question question, QuestionState state, DateTime now) {
+    final origin = _currentCollectionOrigin(
+      question,
+      inheritedOrigin: state.reviewOrigin ?? state.favoriteOrigin,
+    );
+    state
+      ..mastery = Mastery.needsPractice
+      ..practiceQueuedAt = now.toIso8601String()
+      ..reviewAddedAt = now.add(recentPracticeDuration).toIso8601String()
+      ..reviewOrigin = origin;
+  }
+
   void setMastery(Question question, Mastery mastery) {
     final state = stateOf(question.id);
-    final wasInReview = state.mastery == Mastery.needsPractice ||
-        state.mastery == Mastery.notKnown;
-    final nextMastery =
-        mastery != Mastery.notStarted && state.mastery == mastery
-            ? Mastery.notStarted
-            : mastery;
-    final willBeInReview =
-        nextMastery == Mastery.needsPractice || nextMastery == Mastery.notKnown;
-    if (!wasInReview && willBeInReview) {
-      state.reviewOrigin = _currentCollectionOrigin(
-        question,
-        inheritedOrigin: state.favoriteOrigin,
-      );
-    } else if (!willBeInReview) {
-      state.reviewOrigin = null;
+    if (mastery != Mastery.needsPractice && state.mastery == mastery) {
+      return;
     }
-    state.mastery = nextMastery;
+    final now = _clock();
+    switch (mastery) {
+      case Mastery.needsPractice:
+        _queueForPractice(question, state, now);
+      case Mastery.notKnown:
+        state
+          ..mastery = Mastery.notKnown
+          ..practiceQueuedAt = null
+          ..reviewAddedAt = now.toIso8601String()
+          ..reviewOrigin = _currentCollectionOrigin(
+            question,
+            inheritedOrigin: state.reviewOrigin ?? state.favoriteOrigin,
+          );
+      case Mastery.mastered:
+        state.mastery = Mastery.mastered;
+        _clearReviewPlacement(state);
+      case Mastery.notStarted:
+        state.mastery = Mastery.notStarted;
+        _clearReviewPlacement(state);
+    }
     state.inWrongBook = false;
-    state.updatedAt = DateTime.now().toIso8601String();
+    state.updatedAt = now.toIso8601String();
     events.insert(
       0,
       StudyEvent.now(
         questionId: question.id,
         categoryId: question.categoryIds.firstOrNull,
-        action: '${nextMastery.value}_mark',
+        action: '${mastery.value}_mark',
         categoryName: displayPath(question),
         serial: question.serial,
       ),
@@ -654,6 +858,9 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     _scheduleSave();
   }
+
+  void clearMastery(Question question) =>
+      setMastery(question, Mastery.notStarted);
 
   void toggleFavorite(Question question) {
     final state = stateOf(question.id);
@@ -695,24 +902,20 @@ class AppController extends ChangeNotifier {
     final isCorrect = selected.length == correct.length &&
         selected.toSet().containsAll(correct);
     final state = stateOf(question.id);
-    final wasInReview = state.mastery == Mastery.needsPractice ||
-        state.mastery == Mastery.notKnown;
-    final now = DateTime.now().toIso8601String();
+    final nowValue = _clock();
+    final now = nowValue.toIso8601String();
     state
       ..selectedOptions =
           selected.map((index) => String.fromCharCode(65 + index)).toList()
       ..lastCorrect = isCorrect
       ..lastAttemptAt = now
       ..updatedAt = now
-      ..wrongCount = isCorrect ? 0 : 1
-      ..mastery = isCorrect ? Mastery.mastered : Mastery.needsPractice;
+      ..wrongCount = isCorrect ? 0 : 1;
     if (isCorrect) {
-      state.reviewOrigin = null;
-    } else if (!wasInReview) {
-      state.reviewOrigin = _currentCollectionOrigin(
-        question,
-        inheritedOrigin: state.favoriteOrigin,
-      );
+      state.mastery = Mastery.mastered;
+      _clearReviewPlacement(state);
+    } else {
+      _queueForPractice(question, state, nowValue);
     }
     state.inWrongBook = false;
     events.insert(
@@ -755,7 +958,7 @@ class AppController extends ChangeNotifier {
     final sourceEvents = eventValues ?? events;
     return {
       'format': 'daguan-android-progress',
-      'version': 1,
+      'version': progressVersion,
       'updatedAt': DateTime.now().toIso8601String(),
       'questionCount': questions.length,
       'states': {
@@ -775,6 +978,7 @@ class AppController extends ChangeNotifier {
               'last_question_id': null,
               'workspace_page': workspacePage,
               'review_filter': reviewFilter.name,
+              'review_sort': reviewSort.name,
               'canvas_open': false,
               'updated_at': DateTime.now().toIso8601String(),
             }
@@ -784,6 +988,7 @@ class AppController extends ChangeNotifier {
               'last_question_id': selectedQuestionId,
               'workspace_page': workspacePage,
               'review_filter': reviewFilter.name,
+              'review_sort': reviewSort.name,
               'canvas_open': canvasOpen,
               'updated_at': DateTime.now().toIso8601String(),
             },
@@ -852,6 +1057,13 @@ class AppController extends ChangeNotifier {
               ? _requiredBool(state['favorite'], 'favorite')
               : false,
           updatedAt: state['updatedAt'] as String?,
+          practiceQueuedAt: state['practiceQueuedAt'] as String?,
+          reviewAddedAt: state['reviewAddedAt'] as String?,
+          reviewOrigin: state['reviewOrigin'] is Map
+              ? CollectionOrigin.fromJson(
+                  Map<String, dynamic>.from(state['reviewOrigin'] as Map),
+                )
+              : null,
         );
       }
       if (root.containsKey('events')) {
@@ -867,20 +1079,70 @@ class AppController extends ChangeNotifier {
       for (final entry in states.entries)
         entry.key: QuestionState.fromJson(entry.value.toJson()),
     };
+    final latestPracticeEvent = <int, StudyEvent>{};
+    for (final event in incomingEvents) {
+      if (event.action != 'answer_wrong' &&
+          event.action != 'needs_practice_mark') {
+        continue;
+      }
+      final createdAt = _date(event.createdAt);
+      if (createdAt == null) continue;
+      final previous = latestPracticeEvent[event.questionId];
+      if (previous == null ||
+          createdAt.isAfter(_date(previous.createdAt)!)) {
+        latestPracticeEvent[event.questionId] = event;
+      }
+    }
     var updatedQuestions = 0;
-    final now = DateTime.now().toIso8601String();
+    final importedAt = _clock();
+    final now = importedAt.toIso8601String();
     for (final change in changes.values) {
       if (!knownQuestionIds.contains(change.questionId)) {
         unknownQuestionIds.add(change.questionId);
         continue;
       }
-      final state =
-          nextStates.putIfAbsent(change.questionId, QuestionState.new);
+      final state = nextStates.putIfAbsent(
+        change.questionId,
+        QuestionState.new,
+      );
       var changed = false;
-      if (change.hasMastery && state.mastery != change.mastery) {
+      if (change.hasMastery) {
+        final oldMastery = state.mastery;
+        final oldQueuedAt = state.practiceQueuedAt;
+        final oldReviewAddedAt = state.reviewAddedAt;
         state.mastery = change.mastery;
-        state.reviewOrigin = null;
-        changed = true;
+        switch (change.mastery) {
+          case Mastery.needsPractice:
+            final practiceEvent = latestPracticeEvent[change.questionId];
+            final reliableQueuedAt = _date(change.practiceQueuedAt) ??
+                _date(practiceEvent?.createdAt);
+            state
+              ..practiceQueuedAt = reliableQueuedAt?.toIso8601String()
+              ..reviewAddedAt = reliableQueuedAt == null
+                  ? change.reviewAddedAt ?? now
+                  : reliableQueuedAt
+                      .add(recentPracticeDuration)
+                      .toIso8601String()
+              ..reviewOrigin = change.reviewOrigin ??
+                  (practiceEvent == null ||
+                          practiceEvent.categoryName.trim().isEmpty
+                      ? null
+                      : CollectionOrigin(
+                          categoryId: practiceEvent.categoryId,
+                          categoryPath: practiceEvent.categoryName,
+                          position: practiceEvent.serial,
+                        ));
+          case Mastery.notKnown:
+            state
+              ..practiceQueuedAt = null
+              ..reviewAddedAt = change.reviewAddedAt ?? now
+              ..reviewOrigin = change.reviewOrigin;
+          case Mastery.notStarted || Mastery.mastered:
+            _clearReviewPlacement(state);
+        }
+        changed = oldMastery != state.mastery ||
+            oldQueuedAt != state.practiceQueuedAt ||
+            oldReviewAddedAt != state.reviewAddedAt;
       }
       if (change.hasFavorite && state.favorite != change.favorite) {
         state.favorite = change.favorite;
@@ -994,6 +1256,7 @@ class AppController extends ChangeNotifier {
   @override
   void dispose() {
     _saveTimer?.cancel();
+    _practiceTimer?.cancel();
     super.dispose();
   }
 
@@ -1084,7 +1347,7 @@ class _AppShellState extends State<AppShell> {
     widget.controller.openQuestion(
       question,
       navigationQuestions: questions,
-      navigationTitle: sourcePage == 5 ? collectionTitle : null,
+      navigationTitle: sourcePage == 6 ? collectionTitle : null,
     );
     widget.controller.setWorkspacePage(0);
     setState(() => page = 0);
@@ -1097,7 +1360,7 @@ class _AppShellState extends State<AppShell> {
     setState(() {
       collectionTitle = title;
       collectionQuestions = questions;
-      page = 5;
+      page = 6;
     });
   }
 
@@ -1111,12 +1374,12 @@ class _AppShellState extends State<AppShell> {
       scaffold!.closeEndDrawer();
       return;
     }
-    if (page == 5) {
-      setState(() => page = 4);
+    if (page == 6) {
+      setState(() => page = 5);
       return;
     }
     if (widget.controller.selectedQuestionId != null &&
-        (page == 1 || page == 2)) {
+        (page == 1 || page == 2 || page == 3)) {
       widget.controller.clearSelectedQuestion();
       return;
     }
@@ -1158,6 +1421,10 @@ class _AppShellState extends State<AppShell> {
             controller: widget.controller,
             onOpenOrigin: _openOrigin,
           ),
+          RecentPracticePage(
+            controller: widget.controller,
+            onOpenOrigin: _openOrigin,
+          ),
           ReviewBookPage(
             controller: widget.controller,
             onOpenOrigin: _openOrigin,
@@ -1170,7 +1437,8 @@ class _AppShellState extends State<AppShell> {
             controller: widget.controller,
             onOpenCollection: _openCollection,
             onOpenFavorites: () => _selectPage(1),
-            onOpenHistory: () => _selectPage(3),
+            onOpenRecentPractice: () => _selectPage(2),
+            onOpenHistory: () => _selectPage(4),
             onResetComplete: () => setState(() => page = 0),
           ),
           QuestionCollectionPage(
@@ -1243,7 +1511,7 @@ class _AppShellState extends State<AppShell> {
                         WebStyleHeader(
                           controller: widget.controller,
                           page: page,
-                          customTitle: page == 5 ? collectionTitle : null,
+                          customTitle: page == 6 ? collectionTitle : null,
                           desktop: desktop,
                           navigationCollapsed: navigationCollapsed,
                           questionListCollapsed: questionListCollapsed,
@@ -1260,7 +1528,7 @@ class _AppShellState extends State<AppShell> {
                                         !questionListCollapsed,
                                   )
                               : () => scaffoldKey.currentState?.openEndDrawer(),
-                          onOpenData: () => _selectPage(4),
+                          onOpenData: () => _selectPage(5),
                         ),
                         Expanded(
                           child: ColoredBox(
@@ -1370,27 +1638,36 @@ class WebStyleSidebar extends StatelessWidget {
                   compact: compact,
                 ),
                 _SidebarDestination(
+                  icon: Icons.schedule_outlined,
+                  selectedIcon: Icons.schedule_rounded,
+                  label: '近期复习',
+                  badge: controller.recentPracticeCount,
+                  selected: selectedPage == 2,
+                  onTap: () => onSelectPage(2),
+                  compact: compact,
+                ),
+                _SidebarDestination(
                   icon: Icons.fact_check_outlined,
                   selectedIcon: Icons.fact_check_rounded,
                   label: '复习本',
-                  selected: selectedPage == 2,
-                  onTap: () => onSelectPage(2),
+                  selected: selectedPage == 3,
+                  onTap: () => onSelectPage(3),
                   compact: compact,
                 ),
                 _SidebarDestination(
                   icon: Icons.history_rounded,
                   selectedIcon: Icons.history_rounded,
                   label: '学习记录',
-                  selected: selectedPage == 3,
-                  onTap: () => onSelectPage(3),
+                  selected: selectedPage == 4,
+                  onTap: () => onSelectPage(4),
                   compact: compact,
                 ),
                 _SidebarDestination(
                   icon: Icons.save_alt_rounded,
                   selectedIcon: Icons.save_rounded,
                   label: '数据备份',
-                  selected: selectedPage == 4,
-                  onTap: () => onSelectPage(4),
+                  selected: selectedPage == 5,
+                  onTap: () => onSelectPage(5),
                   compact: compact,
                 ),
               ],
@@ -1484,8 +1761,9 @@ class WebStyleSidebar extends StatelessWidget {
                           controller.selectedCategoryId,
                         ) ==
                         root.id)
-                      for (final major
-                          in controller.childCategoriesOf(root.id)) ...[
+                      for (final major in controller.childCategoriesOf(
+                        root.id,
+                      )) ...[
                         _CategoryTreeTile(
                           label: major.name,
                           icon: Icons.folder_outlined,
@@ -1514,8 +1792,9 @@ class WebStyleSidebar extends StatelessWidget {
                           major.id,
                           controller.selectedCategoryId,
                         ))
-                          for (final minor
-                              in controller.childCategoriesOf(major.id))
+                          for (final minor in controller.childCategoriesOf(
+                            major.id,
+                          ))
                             _CategoryTreeTile(
                               label: minor.name,
                               icon: Icons.circle,
@@ -1552,6 +1831,7 @@ class _SidebarDestination extends StatelessWidget {
     required this.selected,
     required this.onTap,
     required this.compact,
+    this.badge,
   });
 
   final IconData icon;
@@ -1560,6 +1840,7 @@ class _SidebarDestination extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
   final bool compact;
+  final int? badge;
 
   @override
   Widget build(BuildContext context) {
@@ -1603,6 +1884,10 @@ class _SidebarDestination extends StatelessWidget {
                             selected ? FontWeight.w700 : FontWeight.w600,
                       ),
                     ),
+                    if (badge case final value?) ...[
+                      const Spacer(),
+                      _CountBadge(value: value),
+                    ],
                   ],
                 ],
               ),
@@ -1642,7 +1927,7 @@ class WebStyleHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const titles = ['题库', '收藏本', '复习本', '学习记录', '数据备份'];
+    const titles = ['题库', '收藏本', '近期复习', '复习本', '学习记录', '数据备份'];
     return Container(
       height: 64,
       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -1808,9 +2093,7 @@ class LibraryPage extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 14),
-              Expanded(
-                child: QuestionDetail(controller: controller),
-              ),
+              Expanded(child: QuestionDetail(controller: controller)),
             ],
           );
         }
@@ -2082,8 +2365,12 @@ class QuestionList extends StatelessWidget {
                 ),
               ),
             Padding(
-              padding:
-                  EdgeInsets.fromLTRB(10, showCategoryButton ? 4 : 10, 10, 8),
+              padding: EdgeInsets.fromLTRB(
+                10,
+                showCategoryButton ? 4 : 10,
+                10,
+                8,
+              ),
               child: SearchBar(
                 elevation: WidgetStateProperty.all(0),
                 backgroundColor: WidgetStateProperty.all(AppColors.canvas),
@@ -2127,10 +2414,7 @@ class QuestionList extends StatelessWidget {
                     IconButton(
                       tooltip: '批量导出',
                       onPressed: questions.isEmpty ? null : openBatchExport,
-                      icon: const Icon(
-                        Icons.file_download_outlined,
-                        size: 20,
-                      ),
+                      icon: const Icon(Icons.file_download_outlined, size: 20),
                     ),
                   ],
                 ),
@@ -2175,8 +2459,9 @@ class QuestionList extends StatelessWidget {
                                   borderRadius: BorderRadius.circular(9),
                                   border: Border.all(
                                     color: selected
-                                        ? AppColors.primary
-                                            .withValues(alpha: .3)
+                                        ? AppColors.primary.withValues(
+                                            alpha: .3,
+                                          )
                                         : AppColors.borderLight,
                                   ),
                                 ),
@@ -2226,9 +2511,14 @@ class QuestionList extends StatelessWidget {
                                                             'single_choice'
                                                         ? '选择题'
                                                         : '解答题'
-                                                : origin == null
-                                                    ? '${title ?? '题单'} ${index + 1}/${questions.length} · 收录位置未知'
-                                                    : '${title ?? '题单'} ${index + 1}/${questions.length} · ${origin.categoryPath}',
+                                                : questionBook ==
+                                                        QuestionBook
+                                                            .recentPractice
+                                                    ? '${controller.recentPracticeCountdown(question)} · '
+                                                        '${origin?.categoryPath ?? '来源位置未知'}'
+                                                    : origin == null
+                                                        ? '${title ?? '题单'} ${index + 1}/${questions.length} · 收录位置未知'
+                                                        : '${title ?? '题单'} ${index + 1}/${questions.length} · ${origin.categoryPath}',
                                             maxLines: 1,
                                             overflow: TextOverflow.ellipsis,
                                             style: const TextStyle(
@@ -2387,10 +2677,7 @@ class _ChapterPickerSheetState extends State<_ChapterPickerSheet> {
 }
 
 class _CanvasNavigationSelection {
-  const _CanvasNavigationSelection({
-    required this.question,
-    this.categoryId,
-  });
+  const _CanvasNavigationSelection({required this.question, this.categoryId});
 
   final Question question;
   final int? categoryId;
@@ -2408,10 +2695,7 @@ class _CanvasQuestionPickerSheet extends StatefulWidget {
 
 class _CanvasQuestionPickerSheetState
     extends State<_CanvasQuestionPickerSheet> {
-  int? subjectId;
-  int? majorId;
-  int? minorId;
-  int? contentId;
+  List<int> selectedPath = [];
   String query = '';
 
   bool get fixedSequence => widget.controller.fixedNavigationQuestions != null;
@@ -2420,55 +2704,90 @@ class _CanvasQuestionPickerSheetState
   void initState() {
     super.initState();
     if (fixedSequence) return;
-    final lineage =
-        widget.controller.lineageOf(widget.controller.selectedCategoryId);
-    subjectId = lineage.firstOrNull?.id;
-    majorId = lineage.length > 1 ? lineage[1].id : null;
-    minorId = lineage.length > 2 ? lineage[2].id : null;
-    contentId = lineage.length > 3 ? lineage.last.id : minorId;
-    _fillMissingLevels();
+    selectedPath = widget.controller
+        .lineageOf(widget.controller.selectedCategoryId)
+        .map((category) => category.id)
+        .toList();
+    selectedPath = _validPath(selectedPath);
+    if (selectedPath.isEmpty && widget.controller.rootCategories.isNotEmpty) {
+      selectedPath = [widget.controller.rootCategories.first.id];
+    }
   }
 
-  List<Category> get majorChoices => subjectId == null
-      ? const []
-      : widget.controller.childCategoriesOf(subjectId);
-
-  List<Category> get minorChoices =>
-      majorId == null ? const [] : widget.controller.childCategoriesOf(majorId);
-
-  List<Category> get contentChoices {
-    final minor =
-        minorId == null ? null : widget.controller.categoryById[minorId!];
-    if (minor == null) return const [];
-    final result = <Category>[minor];
-    final seen = <int>{minor.id};
-    for (final category in widget.controller.chapterChoicesFor(minor.id)) {
-      if (seen.add(category.id)) result.add(category);
+  List<int> _validPath(List<int> path) {
+    final result = <int>[];
+    for (final id in path) {
+      final choices = result.isEmpty
+          ? widget.controller.rootCategories
+          : widget.controller.childCategoriesOf(result.last);
+      if (!choices.any((category) => category.id == id)) break;
+      result.add(id);
     }
     return result;
   }
 
-  void _fillMissingLevels() {
-    final majors = majorChoices;
-    if (!majors.any((category) => category.id == majorId)) {
-      majorId = majors.firstOrNull?.id;
+  void _selectRoot(int? value) {
+    if (value == null) return;
+    setState(() => selectedPath = [value]);
+  }
+
+  void _selectChild(int parentIndex, int? value) {
+    if (value == null) return;
+    final parentId = selectedPath[parentIndex];
+    setState(() {
+      selectedPath = selectedPath.take(parentIndex + 1).toList();
+      if (value != parentId) selectedPath.add(value);
+    });
+  }
+
+  String _levelLabel(int index) {
+    return switch (index) {
+      0 => '学科',
+      1 => '大章节',
+      2 => '小章节',
+      3 => '具体内容',
+      _ => '细分类 ${index - 3}',
+    };
+  }
+
+  List<Widget> _categorySelectors() {
+    if (widget.controller.rootCategories.isEmpty) return const [];
+    final selectors = <Widget>[
+      _categoryDropdown(
+        label: _levelLabel(0),
+        value: selectedPath.firstOrNull,
+        choices: widget.controller.rootCategories,
+        onChanged: _selectRoot,
+      ),
+    ];
+    for (var parentIndex = 0;
+        parentIndex < selectedPath.length;
+        parentIndex++) {
+      final parentId = selectedPath[parentIndex];
+      final children = widget.controller.childCategoriesOf(parentId);
+      if (children.isEmpty) break;
+      selectors.add(const SizedBox(height: 8));
+      selectors.add(
+        _categoryDropdown(
+          label: _levelLabel(parentIndex + 1),
+          value: selectedPath.length > parentIndex + 1
+              ? selectedPath[parentIndex + 1]
+              : parentId,
+          choices: children,
+          allCategory: widget.controller.categoryById[parentId],
+          onChanged: (value) => _selectChild(parentIndex, value),
+        ),
+      );
     }
-    final minors = minorChoices;
-    if (!minors.any((category) => category.id == minorId)) {
-      minorId = minors.firstOrNull?.id;
-    }
-    final contents = contentChoices;
-    if (!contents.any((category) => category.id == contentId)) {
-      contentId = contents.firstOrNull?.id;
-    }
+    return selectors;
   }
 
   List<Question> get visibleQuestions {
     final base = fixedSequence
         ? widget.controller.fixedNavigationQuestions!
-        : contentId == null
+        : selectedPath.isEmpty
             ? const <Question>[]
-            : widget.controller.questionsForCategory(contentId!);
+            : widget.controller.questionsForCategory(selectedPath.last);
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) return base;
     return base
@@ -2510,57 +2829,13 @@ class _CanvasQuestionPickerSheetState
         if (!fixedSequence)
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 2, 14, 10),
-            child: Column(
-              children: [
-                _categoryDropdown(
-                  label: '学科',
-                  value: subjectId,
-                  choices: widget.controller.rootCategories,
-                  onChanged: (value) {
-                    setState(() {
-                      subjectId = value;
-                      majorId = null;
-                      minorId = null;
-                      contentId = null;
-                      _fillMissingLevels();
-                    });
-                  },
-                ),
-                const SizedBox(height: 8),
-                _categoryDropdown(
-                  label: '大章节',
-                  value: majorId,
-                  choices: majorChoices,
-                  onChanged: (value) {
-                    setState(() {
-                      majorId = value;
-                      minorId = null;
-                      contentId = null;
-                      _fillMissingLevels();
-                    });
-                  },
-                ),
-                const SizedBox(height: 8),
-                _categoryDropdown(
-                  label: '小章节',
-                  value: minorId,
-                  choices: minorChoices,
-                  onChanged: (value) {
-                    setState(() {
-                      minorId = value;
-                      contentId = null;
-                      _fillMissingLevels();
-                    });
-                  },
-                ),
-                const SizedBox(height: 8),
-                _categoryDropdown(
-                  label: '具体内容',
-                  value: contentId,
-                  choices: contentChoices,
-                  onChanged: (value) => setState(() => contentId = value),
-                ),
-              ],
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * .42,
+              ),
+              child: SingleChildScrollView(
+                child: Column(children: _categorySelectors()),
+              ),
             ),
           ),
         Padding(
@@ -2581,9 +2856,10 @@ class _CanvasQuestionPickerSheetState
                 child: Text(
                   fixedSequence
                       ? '仅显示当前题单'
-                      : contentId == null
-                          ? '请选择具体内容'
-                          : widget.controller.categoryById[contentId!]?.path ??
+                      : selectedPath.isEmpty
+                          ? '请选择分类'
+                          : widget.controller.categoryById[selectedPath.last]
+                                  ?.path ??
                               '',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -2629,9 +2905,7 @@ class _CanvasQuestionPickerSheetState
                       title: Text(
                         '${displayPosition == null ? '#—' : '#$displayPosition'} · '
                         '${_sourceLabel(question.source)}',
-                        key: ValueKey(
-                          'canvas-question-choice-${question.id}',
-                        ),
+                        key: ValueKey('canvas-question-choice-${question.id}'),
                         style: const TextStyle(fontWeight: FontWeight.w700),
                       ),
                       trailing: const Icon(Icons.chevron_right_rounded),
@@ -2639,7 +2913,8 @@ class _CanvasQuestionPickerSheetState
                         context,
                         _CanvasNavigationSelection(
                           question: question,
-                          categoryId: fixedSequence ? null : contentId,
+                          categoryId:
+                              fixedSequence ? null : selectedPath.lastOrNull,
                         ),
                       ),
                     );
@@ -2655,6 +2930,7 @@ class _CanvasQuestionPickerSheetState
     required int? value,
     required List<Category> choices,
     required ValueChanged<int?> onChanged,
+    Category? allCategory,
   }) {
     return DropdownButtonFormField<int>(
       key: ValueKey('$label-$value-${choices.length}'),
@@ -2668,6 +2944,15 @@ class _CanvasQuestionPickerSheetState
         ),
       ),
       items: [
+        if (allCategory != null)
+          DropdownMenuItem(
+            value: allCategory.id,
+            child: Text(
+              '全部（${allCategory.name}）',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
         for (final category in choices)
           DropdownMenuItem(
             value: category.id,
@@ -2741,9 +3026,9 @@ class _QuestionDetailState extends State<QuestionDetail> {
 
   void _copy(String value, String label) {
     Clipboard.setData(ClipboardData(text: value));
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('$label已复制')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('$label已复制')));
   }
 
   void _moveQuestion(int offset) {
@@ -2764,6 +3049,10 @@ class _QuestionDetailState extends State<QuestionDetail> {
       displayPosition: widget.controller.displayPosition(question),
       index: widget.controller.selectedQuestionIndex(questions),
       total: questions.length,
+      canEnterSequence:
+          widget.controller.navigationBook == QuestionBook.recentPractice &&
+              widget.controller.selectedQuestionIndex(questions) < 0 &&
+              questions.isNotEmpty,
       state: widget.controller.stateOf(question.id),
       correctOptionIndexes: widget.controller.correctOptionIndexes(question),
     );
@@ -2784,10 +3073,7 @@ class _QuestionDetailState extends State<QuestionDetail> {
     );
     if (selection == null) return null;
     if (selection.categoryId case final categoryId?) {
-      widget.controller.openQuestionInCategory(
-        selection.question,
-        categoryId,
-      );
+      widget.controller.openQuestionInCategory(selection.question, categoryId);
     } else {
       widget.controller.openQuestion(
         selection.question,
@@ -2905,8 +3191,10 @@ class _QuestionDetailState extends State<QuestionDetail> {
     final questions = widget.controller.currentQuestionSequence;
     final questionIndex = widget.controller.selectedQuestionIndex(questions);
     final canGoBack = questionIndex > 0;
-    final canGoForward =
-        questionIndex >= 0 && questionIndex < questions.length - 1;
+    final canGoForward = (activeBook == QuestionBook.recentPractice &&
+            questionIndex < 0 &&
+            questions.isNotEmpty) ||
+        (questionIndex >= 0 && questionIndex < questions.length - 1);
     final interactiveChoice =
         question.type == 'single_choice' || question.type == 'multiple_choice';
     final correctOptions = widget.controller.correctOptionIndexes(question);
@@ -3057,10 +3345,6 @@ class _QuestionDetailState extends State<QuestionDetail> {
                 ),
                 const SizedBox(height: 14),
                 MathContent(question.stem),
-                if (question.assets.isNotEmpty) ...[
-                  const SizedBox(height: 16),
-                  QuestionImageGallery(assetReferences: question.assets),
-                ],
                 for (var index = 0; index < question.options.length; index++)
                   _QuestionOption(
                     key: ValueKey('question-option-$index'),
@@ -3077,8 +3361,9 @@ class _QuestionDetailState extends State<QuestionDetail> {
                         : () {
                             if (submitted) {
                               if (!selectedOptions.contains(index)) return;
-                              final editingOptions =
-                                  Set<int>.from(selectedOptions)..remove(index);
+                              final editingOptions = Set<int>.from(
+                                selectedOptions,
+                              )..remove(index);
                               widget.controller.clearAnswer(question);
                               setState(() => pendingOptions = editingOptions);
                               return;
@@ -3090,10 +3375,7 @@ class _QuestionDetailState extends State<QuestionDetail> {
                                 }
                               });
                             } else {
-                              widget.controller.submitAnswer(
-                                question,
-                                {index},
-                              );
+                              widget.controller.submitAnswer(question, {index});
                             }
                           },
                   ),
@@ -3143,6 +3425,13 @@ class _QuestionDetailState extends State<QuestionDetail> {
                           onSelected: (_) =>
                               widget.controller.setMastery(question, mastery),
                         ),
+                      if (state.mastery != Mastery.notStarted)
+                        TextButton.icon(
+                          onPressed: () =>
+                              widget.controller.clearMastery(question),
+                          icon: const Icon(Icons.remove_circle_outline_rounded),
+                          label: const Text('清除状态'),
+                        ),
                     ],
                   ),
                 ),
@@ -3154,9 +3443,7 @@ class _QuestionDetailState extends State<QuestionDetail> {
                   ),
                   clipBehavior: Clip.antiAlias,
                   child: ExpansionTile(
-                    key: ValueKey(
-                      'answer-${question.id}-${state.lastCorrect}',
-                    ),
+                    key: ValueKey('answer-${question.id}-${state.lastCorrect}'),
                     initiallyExpanded: submitted,
                     backgroundColor: AppColors.surface,
                     collapsedBackgroundColor: AppColors.surface,
@@ -3405,10 +3692,7 @@ class _QuestionNavigator extends StatelessWidget {
 }
 
 class _AnswerFeedback extends StatelessWidget {
-  const _AnswerFeedback({
-    required this.correct,
-    required this.onRetry,
-  });
+  const _AnswerFeedback({required this.correct, required this.onRetry});
 
   final bool correct;
   final VoidCallback onRetry;
@@ -3436,7 +3720,7 @@ class _AnswerFeedback extends StatelessWidget {
               style: TextStyle(color: color, fontWeight: FontWeight.w700),
             ),
           ),
-          TextButton(onPressed: onRetry, child: const Text('重新作答')),
+          TextButton(onPressed: onRetry, child: const Text('开始重做')),
         ],
       ),
     );
@@ -3550,10 +3834,7 @@ class _QuestionOption extends StatelessWidget {
                     color: Color(0xff16a34a),
                   )
                 else if (wrong)
-                  const Icon(
-                    Icons.cancel_rounded,
-                    color: Color(0xffdc2626),
-                  ),
+                  const Icon(Icons.cancel_rounded, color: Color(0xffdc2626)),
               ],
             ),
           ),
@@ -3644,125 +3925,16 @@ class _ReliableTapState extends State<_ReliableTap> {
 }
 
 class QuestionImageGallery extends StatelessWidget {
-  const QuestionImageGallery({
-    super.key,
-    required this.assetReferences,
-  });
+  const QuestionImageGallery({super.key, required this.assetReferences});
 
   final List<String> assetReferences;
 
-  String? _assetPath(String reference) {
-    final match =
-        RegExp(r'^asset://sha256/([a-f0-9]{64})$').firstMatch(reference);
-    return match == null
-        ? null
-        : 'assets/question_images/${match.group(1)}.png';
-  }
-
   @override
   Widget build(BuildContext context) {
-    final paths = assetReferences
-        .map(_assetPath)
-        .whereType<String>()
-        .toList(growable: false);
-    if (paths.isEmpty) return const SizedBox.shrink();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        for (final path in paths) ...[
-          _ZoomableQuestionImage(path: path),
-          const SizedBox(height: 12),
-        ],
-      ],
-    );
-  }
-}
-
-class _ZoomableQuestionImage extends StatelessWidget {
-  const _ZoomableQuestionImage({required this.path});
-
-  final String path;
-
-  Widget _image(BuildContext context) => Image.asset(
-        path,
-        fit: BoxFit.contain,
-        errorBuilder: (context, error, stackTrace) => Container(
-          padding: const EdgeInsets.all(16),
-          alignment: Alignment.center,
-          child: const Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.broken_image_outlined),
-              SizedBox(width: 10),
-              Flexible(child: Text('题图文件损坏或缺失')),
-            ],
-          ),
-        ),
-      );
-
-  @override
-  Widget build(BuildContext context) {
-    return Semantics(
-      label: '题图，支持双指缩放',
-      child: Container(
-        height: 300,
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceContainerLowest,
-          border: Border.all(color: Theme.of(context).dividerColor),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        clipBehavior: Clip.antiAlias,
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: InteractiveViewer(
-                minScale: 1,
-                maxScale: 6,
-                boundaryMargin: const EdgeInsets.all(80),
-                child: Center(child: _image(context)),
-              ),
-            ),
-            Positioned(
-              right: 8,
-              top: 8,
-              child: IconButton.filledTonal(
-                tooltip: '全屏查看题图',
-                icon: const Icon(Icons.fullscreen),
-                onPressed: () => showDialog<void>(
-                  context: context,
-                  useSafeArea: false,
-                  builder: (context) => Dialog.fullscreen(
-                    backgroundColor: Colors.black,
-                    child: Stack(
-                      children: [
-                        Positioned.fill(
-                          child: InteractiveViewer(
-                            minScale: .5,
-                            maxScale: 8,
-                            boundaryMargin: const EdgeInsets.all(160),
-                            child: Center(child: _image(context)),
-                          ),
-                        ),
-                        Positioned(
-                          left: 12,
-                          top: 12,
-                          child: SafeArea(
-                            child: IconButton.filled(
-                              tooltip: '关闭',
-                              onPressed: () => Navigator.pop(context),
-                              icon: const Icon(Icons.close),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+    if (assetReferences.isEmpty) return const SizedBox.shrink();
+    return MathContent(
+      assetReferences.map((reference) => '![]($reference)').join('\n\n'),
+      selectable: false,
     );
   }
 }
@@ -3793,6 +3965,29 @@ class FavoritesPage extends StatelessWidget {
   }
 }
 
+class RecentPracticePage extends StatelessWidget {
+  const RecentPracticePage({
+    super.key,
+    required this.controller,
+    required this.onOpenOrigin,
+  });
+
+  final AppController controller;
+  final void Function(Question, CollectionOrigin) onOpenOrigin;
+
+  @override
+  Widget build(BuildContext context) => _QuestionBookWorkspace(
+        controller: controller,
+        questions: controller.recentPracticeQuestions,
+        questionBook: QuestionBook.recentPractice,
+        title: '近期复习',
+        emptyIcon: Icons.schedule_outlined,
+        emptyTitle: '最近没有需要集中练习的题目',
+        emptyMessage: '答错或标记为“需练习”的题目，会在这里保留 48 小时。',
+        onOpenOrigin: onOpenOrigin,
+      );
+}
+
 class ReviewBookPage extends StatelessWidget {
   const ReviewBookPage({
     super.key,
@@ -3808,32 +4003,59 @@ class ReviewBookPage extends StatelessWidget {
     final questions = controller.filteredReviewQuestions;
     return Column(
       children: [
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SegmentedButton<ReviewFilter>(
-            showSelectedIcon: false,
-            segments: [
-              ButtonSegment(
-                value: ReviewFilter.all,
-                label: Text('全部 ${controller.reviewCount(ReviewFilter.all)}'),
-              ),
-              ButtonSegment(
-                value: ReviewFilter.needsPractice,
-                label: Text(
-                  '需练习 ${controller.reviewCount(ReviewFilter.needsPractice)}',
+        Row(
+          children: [
+            Expanded(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: SegmentedButton<ReviewFilter>(
+                  showSelectedIcon: false,
+                  segments: [
+                    ButtonSegment(
+                      value: ReviewFilter.all,
+                      label: Text(
+                        '全部 ${controller.reviewCount(ReviewFilter.all)}',
+                      ),
+                    ),
+                    ButtonSegment(
+                      value: ReviewFilter.needsPractice,
+                      label: Text(
+                        '需练习 ${controller.reviewCount(ReviewFilter.needsPractice)}',
+                      ),
+                    ),
+                    ButtonSegment(
+                      value: ReviewFilter.notKnown,
+                      label: Text(
+                        '完全不会 ${controller.reviewCount(ReviewFilter.notKnown)}',
+                      ),
+                    ),
+                  ],
+                  selected: {controller.reviewFilter},
+                  onSelectionChanged: (value) =>
+                      controller.setReviewFilter(value.first),
                 ),
               ),
-              ButtonSegment(
-                value: ReviewFilter.notKnown,
-                label: Text(
-                  '完全不会 ${controller.reviewCount(ReviewFilter.notKnown)}',
+            ),
+            const SizedBox(width: 8),
+            SegmentedButton<ReviewSort>(
+              showSelectedIcon: false,
+              segments: const [
+                ButtonSegment(
+                  value: ReviewSort.ascending,
+                  icon: Icon(Icons.arrow_upward_rounded, size: 17),
+                  tooltip: '加入时间正序',
                 ),
-              ),
-            ],
-            selected: {controller.reviewFilter},
-            onSelectionChanged: (value) =>
-                controller.setReviewFilter(value.first),
-          ),
+                ButtonSegment(
+                  value: ReviewSort.descending,
+                  icon: Icon(Icons.arrow_downward_rounded, size: 17),
+                  tooltip: '加入时间倒序',
+                ),
+              ],
+              selected: {controller.reviewSort},
+              onSelectionChanged: (value) =>
+                  controller.setReviewSort(value.first),
+            ),
+          ],
         ),
         const SizedBox(height: 10),
         Expanded(
@@ -3844,7 +4066,7 @@ class ReviewBookPage extends StatelessWidget {
             title: '复习题目',
             emptyIcon: Icons.fact_check_outlined,
             emptyTitle: '当前分类还没有题目',
-            emptyMessage: '标记为“需练习”或“完全不会”的题目会集中在这里。',
+            emptyMessage: '“完全不会”和超过 48 小时的“需练习”会集中在这里。',
             onOpenOrigin: onOpenOrigin,
           ),
         ),
@@ -4137,6 +4359,7 @@ class ExportPage extends StatefulWidget {
     required this.controller,
     required this.onOpenCollection,
     required this.onOpenFavorites,
+    required this.onOpenRecentPractice,
     required this.onOpenHistory,
     required this.onResetComplete,
   });
@@ -4144,6 +4367,7 @@ class ExportPage extends StatefulWidget {
   final AppController controller;
   final void Function(String title, List<Question> questions) onOpenCollection;
   final VoidCallback onOpenFavorites;
+  final VoidCallback onOpenRecentPractice;
   final VoidCallback onOpenHistory;
   final VoidCallback onResetComplete;
 
@@ -4162,9 +4386,9 @@ class _ExportPageState extends State<ExportPage> {
       final source = await widget.controller.storage.pickImportJson();
       if (!mounted) return;
       if (source == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('已取消导入')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('已取消导入')));
         return;
       }
       final result = await widget.controller.importSyncJson(source);
@@ -4180,9 +4404,9 @@ class _ExportPageState extends State<ExportPage> {
       );
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('导入失败：$error')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('导入失败：$error')));
       }
     } finally {
       if (mounted) setState(() => importing = false);
@@ -4218,15 +4442,15 @@ class _ExportPageState extends State<ExportPage> {
     try {
       await widget.controller.resetAllUserData();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('所有数据和设置已清除')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('所有数据和设置已清除')));
       widget.onResetComplete();
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('清除失败：$error')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('清除失败：$error')));
       }
     } finally {
       if (mounted) setState(() => resetting = false);
@@ -4243,6 +4467,7 @@ class _ExportPageState extends State<ExportPage> {
         )
         .length;
     final reviewQuestions = widget.controller.reviewQuestions;
+    final recentPracticeQuestions = widget.controller.recentPracticeQuestions;
     return Align(
       alignment: Alignment.topCenter,
       child: SingleChildScrollView(
@@ -4374,14 +4599,19 @@ class _ExportPageState extends State<ExportPage> {
                     onTap: widget.onOpenFavorites,
                   ),
                   StatCard(
+                    label: '近期复习',
+                    value: recentPracticeQuestions.length,
+                    color: Color(0xff0891b2),
+                    icon: Icons.schedule_outlined,
+                    onTap: widget.onOpenRecentPractice,
+                  ),
+                  StatCard(
                     label: '复习本',
                     value: reviewQuestions.length,
                     color: Color(0xff7c3aed),
                     icon: Icons.fact_check_outlined,
-                    onTap: () => widget.onOpenCollection(
-                      '复习本',
-                      reviewQuestions,
-                    ),
+                    onTap: () =>
+                        widget.onOpenCollection('复习本', reviewQuestions),
                   ),
                   StatCard(
                     label: '学习记录',
@@ -4430,8 +4660,9 @@ class _ExportPageState extends State<ExportPage> {
                             width: double.infinity,
                             child: OutlinedButton.icon(
                               style: OutlinedButton.styleFrom(
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 14),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 14,
+                                ),
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(9),
                                 ),
@@ -4440,9 +4671,7 @@ class _ExportPageState extends State<ExportPage> {
                                   ? null
                                   : _importSyncJson,
                               icon: const Icon(Icons.file_upload_outlined),
-                              label: Text(
-                                importing ? '正在导入…' : '导入源站同步 JSON',
-                              ),
+                              label: Text(importing ? '正在导入…' : '导入源站同步 JSON'),
                             ),
                           ),
                           const SizedBox(height: 10),
@@ -4450,8 +4679,9 @@ class _ExportPageState extends State<ExportPage> {
                             width: double.infinity,
                             child: FilledButton.icon(
                               style: FilledButton.styleFrom(
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 14),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 14,
+                                ),
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(9),
                                 ),
@@ -4464,8 +4694,9 @@ class _ExportPageState extends State<ExportPage> {
                                         final saved =
                                             await widget.controller.export();
                                         if (context.mounted) {
-                                          ScaffoldMessenger.of(context)
-                                              .showSnackBar(
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
                                             SnackBar(
                                               content: Text(
                                                 saved ? '进度文件已保存' : '已取消导出',
@@ -4475,8 +4706,9 @@ class _ExportPageState extends State<ExportPage> {
                                         }
                                       } catch (error) {
                                         if (context.mounted) {
-                                          ScaffoldMessenger.of(context)
-                                              .showSnackBar(
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
                                             SnackBar(
                                               content: Text('导出失败：$error'),
                                             ),
@@ -4489,9 +4721,7 @@ class _ExportPageState extends State<ExportPage> {
                                       }
                                     },
                               icon: const Icon(Icons.file_download_outlined),
-                              label: Text(
-                                exporting ? '正在导出…' : '导出完成情况（JSON）',
-                              ),
+                              label: Text(exporting ? '正在导出…' : '导出完成情况（JSON）'),
                             ),
                           ),
                         ],
