@@ -37,9 +37,9 @@ Android 应用与原站之间的收藏、掌握状态同步，需要配合“大
 - Android 应用导出：`format: "daguan-android-progress"`，`version: 2`，题目标记及近期复习时间位于根节点 `states`。
 - 浏览器插件导出：`format: "daguan-browser-sync"`，`version: 1`，题目标记位于 `question_states.states`。
 
-浏览器插件下载地址（待填入）：
+浏览器插件下载地址：
 
-`https://github.com/<用户名>/<仓库名>/releases`
+`https://github.com/nbntg/daguan-math-browser-bridge`
 
 仓库内置的是空白初始进度，不包含任何账号、收藏、复习记录或学习历史。
 
