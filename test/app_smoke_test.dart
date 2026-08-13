@@ -448,8 +448,9 @@ void main() {
     controller.toggleFavorite(question);
     expect(controller.stateOf(question.id).favoriteOrigin, isNull);
     controller.setMastery(question, Mastery.needsPractice);
-    expect(controller.stateOf(question.id).mastery, Mastery.notStarted);
-    expect(controller.stateOf(question.id).reviewOrigin, isNull);
+    expect(controller.stateOf(question.id).mastery, Mastery.needsPractice);
+    expect(controller.recentPracticeQuestions, contains(question));
+    expect(controller.stateOf(question.id).reviewOrigin, isNotNull);
     controller.dispose();
   });
 
@@ -556,6 +557,39 @@ void main() {
     expect(controller.selectedQuestionId, isNull);
     expect(find.text('收藏题目'), findsOneWidget);
     controller.dispose();
+  });
+
+  testWidgets('近期复习入口显示数量、倒计时并按独立题单打开', (tester) async {
+    final controller = await _loadVisualController();
+    final question = controller.questions.first;
+    controller.setMastery(question, Mastery.needsPractice);
+
+    tester.view
+      ..physicalSize = const Size(1280, 800)
+      ..devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+      controller.dispose();
+    });
+    await tester.pumpWidget(
+      MaterialApp(home: AppShell(controller: controller)),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('近期复习'), findsOneWidget);
+    expect(find.text('1'), findsWidgets);
+
+    await tester.tap(find.text('近期复习'));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(ValueKey('canvas-question-choice-${question.id}')),
+      findsNothing,
+    );
+    expect(find.textContaining('后移入复习本'), findsOneWidget);
+    await tester.tap(find.textContaining('1988 数一二').first);
+    await tester.pumpAndSettle();
+    expect(controller.navigationBook, QuestionBook.recentPractice);
+    expect(controller.currentQuestionSequence, [question]);
   });
 
   testWidgets('平板自适应导航不显示题库总数', (tester) async {
@@ -750,7 +784,8 @@ void main() {
     controller.submitAnswer(question, {0});
     expect(controller.stateOf(question.id).lastCorrect, isFalse);
     expect(controller.stateOf(question.id).mastery, Mastery.needsPractice);
-    expect(controller.reviewQuestions, contains(question));
+    expect(controller.recentPracticeQuestions, contains(question));
+    expect(controller.reviewQuestions, isNot(contains(question)));
     expect(controller.stateOf(question.id).inWrongBook, isFalse);
     expect(controller.stateOf(question.id).wrongCount, 1);
 
@@ -1039,6 +1074,40 @@ void main() {
       }
     });
     final controller = await _loadVisualController();
+    final firstDetail = Category.fromJson({
+      'id': 9001,
+      'parentId': 331,
+      'name': '第一层细分',
+      'path': '高等数学 / 极限 / 函数 / 求函数表达式 / 第一层细分',
+      'directCount': 0,
+      'totalCount': 1,
+    });
+    final secondDetail = Category.fromJson({
+      'id': 9002,
+      'parentId': 9001,
+      'name': '第二层细分',
+      'path': '高等数学 / 极限 / 函数 / 求函数表达式 / 第一层细分 / 第二层细分',
+      'directCount': 1,
+      'totalCount': 1,
+    });
+    controller.categories.addAll([firstDetail, secondDetail]);
+    controller.categoryById
+      ..[firstDetail.id] = firstDetail
+      ..[secondDetail.id] = secondDetail;
+    controller.childrenByParent
+      ..putIfAbsent(firstDetail.parentId, () => []).add(firstDetail)
+      ..putIfAbsent(secondDetail.parentId, () => []).add(secondDetail);
+    final deepQuestion = Question.fromJson({
+      'id': 99901,
+      'serial': 99,
+      'categoryIds': [9002],
+      'stem': '深层分类测试题',
+      'options': <String>[],
+      'answer': '1',
+      'explanation': '',
+      'source': '深层测试题',
+    });
+    controller.questions.add(deepQuestion);
     await tester.runAsync(controller.storage.loadProgress);
     controller.chooseCategory(331);
     controller.chooseQuestion(controller.questions.first.id);
@@ -1083,6 +1152,7 @@ void main() {
     expect(find.text('大章节'), findsOneWidget);
     expect(find.text('小章节'), findsOneWidget);
     expect(find.text('具体内容'), findsOneWidget);
+    expect(find.text('细分类 1'), findsOneWidget);
     final firstQuestionLabel = tester.widget<Text>(
       find.byKey(const ValueKey('canvas-question-choice-1')),
     );
@@ -1095,6 +1165,27 @@ void main() {
       findsNothing,
     );
     expect(find.text('题号 #12'), findsNothing);
+
+    await tester.tap(
+      find.byKey(const ValueKey('细分类 1-331-1')),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('第一层细分').last);
+    await tester.pumpAndSettle();
+    expect(find.text('细分类 2'), findsOneWidget);
+    final secondDetailDropdown = find.byKey(const ValueKey('细分类 2-9001-1'));
+    await tester.ensureVisible(secondDetailDropdown);
+    await tester.pumpAndSettle();
+    await tester.tap(secondDetailDropdown);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('第二层细分').last);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('canvas-question-choice-99901')),
+      findsOneWidget,
+    );
+    expect(
+        find.byKey(const ValueKey('canvas-question-choice-1')), findsNothing);
     controller.dispose();
   });
 
@@ -1269,7 +1360,7 @@ void main() {
     expect((await reopenedStorage.loadWritingToolSettings()).eraserWidth, 24);
   });
 
-  test('重新打开应用恢复复习分类、当前题目和画布位置', () async {
+  test('旧版需练习只清理一次并保留收藏、笔记、记录和画布位置', () async {
     final directory =
         await Directory.systemTemp.createTemp('daguan-resume-test-');
     final messenger =
@@ -1302,13 +1393,30 @@ void main() {
         'states': {
           '$questionId': {
             'mastery': 'needs_practice',
-            'favorite': false,
-            'note': '',
-            'selectedOptions': <String>[],
-            'wrongCount': 0,
+            'favorite': true,
+            'note': '迁移后保留',
+            'selectedOptions': <String>['A'],
+            'lastCorrect': false,
+            'wrongCount': 3,
+            'lastAttemptAt': '2026-08-01T08:00:00.000',
+            'reviewOrigin': {
+              'categoryId': categoryId,
+              'categoryPath': '旧来源',
+              'position': 1,
+            },
           },
         },
-        'events': <dynamic>[],
+        'events': [
+          {
+            'id': 'keep-event',
+            'questionId': questionId,
+            'categoryId': categoryId,
+            'action': 'answer_wrong',
+            'createdAt': '2026-08-01T08:00:00.000',
+            'categoryName': '旧来源',
+            'serial': 1,
+          },
+        ],
         'lastStudy': {
           'category_id': categoryId,
           'last_question_id': questionId,
@@ -1321,13 +1429,28 @@ void main() {
 
     final controller = AppController();
     await controller.load();
-    expect(controller.workspacePage, 2);
+    expect(controller.workspacePage, 0);
     expect(controller.reviewFilter, ReviewFilter.needsPractice);
     expect(controller.selectedQuestionId, questionId);
-    expect(controller.navigationBook, QuestionBook.review);
-    expect(controller.currentQuestionSequence.single.id, questionId);
+    expect(controller.navigationBook, isNull);
+    final migrated = controller.stateOf(questionId);
+    expect(migrated.mastery, Mastery.notStarted);
+    expect(migrated.favorite, isTrue);
+    expect(migrated.note, '迁移后保留');
+    expect(migrated.selectedOptions, isEmpty);
+    expect(migrated.lastCorrect, isNull);
+    expect(migrated.wrongCount, 0);
+    expect(migrated.lastAttemptAt, isNull);
+    expect(migrated.reviewOrigin, isNull);
+    expect(controller.events.single.id, 'keep-event');
     expect(controller.takeResumeCanvasRequest(), isTrue);
     expect(controller.takeResumeCanvasRequest(), isFalse);
+    final saved = decodeObject(
+      await File(
+        '${directory.path}${Platform.pathSeparator}progress.json',
+      ).readAsString(),
+    );
+    expect(saved['version'], AppController.progressVersion);
     controller.dispose();
   });
 

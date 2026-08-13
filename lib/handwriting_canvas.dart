@@ -23,32 +23,53 @@ const _canvas = Color(0xfff8fafc);
 double _pressureScale(double pressure, double strength) =>
     ui.lerpDouble(1, .28 + pressure * .92, strength)!;
 
+final _embeddedAssetImagePattern = RegExp(
+  r'!\[[^\]]*\]\(asset://sha256/[a-f0-9]{64}\)',
+);
+
+int _embeddedImageCount(Iterable<String> fields) => fields.fold(
+      0,
+      (count, field) =>
+          count + _embeddedAssetImagePattern.allMatches(field).length,
+    );
+
 double _estimatedQuestionCardHeight(Question question) {
   final textWeight =
       question.stem.length + question.options.fold(0, (a, b) => a + b.length);
-  return (300 + textWeight * 1.35 + question.assets.length * 260)
-      .clamp(420, 1500);
+  final imageCount = _embeddedImageCount([question.stem, ...question.options]);
+  return math.max(420, 300 + textWeight * 1.35 + imageCount * 320);
 }
 
-double _estimatedAnalysisCardHeight(Question question) =>
-    (330 + (question.answer.length + question.explanation.length) * 1.3)
-        .clamp(420, 1600);
+double _estimatedAnalysisCardHeight(Question question) {
+  final imageCount = _embeddedImageCount([
+    question.answer,
+    question.explanation,
+  ]);
+  return math.max(
+    420,
+    330 +
+        (question.answer.length + question.explanation.length) * 1.3 +
+        imageCount * 320,
+  );
+}
 
 double _estimatedNoteCardHeight(String text) =>
-    (230 + text.length * 1.2).clamp(260, 1200);
+    math.max(260, 230 + text.length * 1.2);
 
 Rect handwritingExportContentBounds(
   HandwritingDocument document,
   Question question, {
   required bool analysisVisible,
   required bool includeTextNote,
+  Map<String, double> cardHeights = const {},
 }) {
-  Rect cardBounds(CanvasCardState state, String source) {
-    final height = switch (source) {
-      'question' => _estimatedQuestionCardHeight(question),
-      'analysis' => _estimatedAnalysisCardHeight(question),
-      _ => _estimatedNoteCardHeight(document.textNote),
-    };
+  Rect cardBounds(String id, CanvasCardState state, String source) {
+    final height = cardHeights[id] ??
+        switch (source) {
+          'question' => _estimatedQuestionCardHeight(question),
+          'analysis' => _estimatedAnalysisCardHeight(question),
+          _ => _estimatedNoteCardHeight(document.textNote),
+        };
     return Rect.fromLTWH(
       state.x,
       state.y,
@@ -57,19 +78,23 @@ Rect handwritingExportContentBounds(
     );
   }
 
-  var bounds = cardBounds(document.questionCard, 'question');
+  var bounds = cardBounds('question', document.questionCard, 'question');
   if (analysisVisible) {
     bounds = bounds.expandToInclude(
-      cardBounds(document.analysisCard, 'analysis'),
+      cardBounds('analysis', document.analysisCard, 'analysis'),
     );
   }
   if (includeTextNote) {
-    bounds = bounds.expandToInclude(cardBounds(document.noteCard, 'note'));
+    bounds = bounds.expandToInclude(
+      cardBounds('note', document.noteCard, 'note'),
+    );
   }
   for (final copy in document.cardCopies) {
     if (copy.source == 'analysis' && !analysisVisible) continue;
     if (copy.source == 'note' && !includeTextNote) continue;
-    bounds = bounds.expandToInclude(cardBounds(copy.state, copy.source));
+    bounds = bounds.expandToInclude(
+      cardBounds(copy.id, copy.state, copy.source),
+    );
   }
   for (final stroke in document.strokes) {
     if (!stroke.erase && !stroke.bounds.isEmpty) {
@@ -87,19 +112,39 @@ Future<Uint8List> renderHandwritingExportPng(
   required bool includeTextNote,
 }) async {
   final boundaryKey = GlobalKey();
-  final bounds = handwritingExportContentBounds(
-    document,
-    question,
-    analysisVisible: analysisVisible,
-    includeTextNote: includeTextNote,
-  );
-  final largest = math.max(bounds.width, bounds.height);
-  final exportScale = largest <= 3600 ? 1.0 : 3600 / largest;
-  final surfaceSize = Size(
-    math.max(1, bounds.width * exportScale),
-    math.max(1, bounds.height * exportScale),
-  );
-  final exportOffset = -bounds.topLeft * exportScale;
+  final cardKeys = <String, GlobalKey>{
+    'question': GlobalKey(debugLabel: 'export-card-question'),
+    if (analysisVisible)
+      'analysis': GlobalKey(debugLabel: 'export-card-analysis'),
+    if (includeTextNote) 'note': GlobalKey(debugLabel: 'export-card-note'),
+    for (final copy in document.cardCopies)
+      if ((copy.source != 'analysis' || analysisVisible) &&
+          (copy.source != 'note' || includeTextNote))
+        copy.id: GlobalKey(debugLabel: 'export-card-${copy.id}'),
+  };
+  late Rect bounds;
+  late double exportScale;
+  late Size surfaceSize;
+  late Offset exportOffset;
+
+  void updateGeometry([Map<String, double> cardHeights = const {}]) {
+    bounds = handwritingExportContentBounds(
+      document,
+      question,
+      analysisVisible: analysisVisible,
+      includeTextNote: includeTextNote,
+      cardHeights: cardHeights,
+    );
+    final largest = math.max(bounds.width, bounds.height);
+    exportScale = largest <= 3600 ? 1.0 : 3600 / largest;
+    surfaceSize = Size(
+      math.max(1, bounds.width * exportScale),
+      math.max(1, bounds.height * exportScale),
+    );
+    exportOffset = -bounds.topLeft * exportScale;
+  }
+
+  updateGeometry();
   final overlay = Overlay.of(context);
   late final OverlayEntry entry;
   entry = OverlayEntry(
@@ -119,6 +164,7 @@ Future<Uint8List> renderHandwritingExportPng(
                 includeTextNote: includeTextNote,
                 offset: exportOffset,
                 scale: exportScale,
+                cardKeys: cardKeys,
               ),
             ),
           ),
@@ -130,6 +176,17 @@ Future<Uint8List> renderHandwritingExportPng(
   try {
     await WidgetsBinding.instance.endOfFrame;
     await Future<void>.delayed(const Duration(milliseconds: 24));
+    final measuredHeights = <String, double>{};
+    for (final entry in cardKeys.entries) {
+      final height = entry.value.currentContext?.size?.height;
+      if (height != null && height > 0) measuredHeights[entry.key] = height;
+    }
+    if (measuredHeights.isNotEmpty) {
+      updateGeometry(measuredHeights);
+      entry.markNeedsBuild();
+      await WidgetsBinding.instance.endOfFrame;
+      await Future<void>.delayed(const Duration(milliseconds: 24));
+    }
     final boundary = boundaryKey.currentContext?.findRenderObject()
         as RenderRepaintBoundary?;
     if (boundary == null) throw StateError('画布尚未完成布局');
@@ -155,6 +212,7 @@ class HandwritingQuestionContext {
     required this.total,
     required this.state,
     required this.correctOptionIndexes,
+    this.canEnterSequence = false,
   });
 
   final Question question;
@@ -165,27 +223,23 @@ class HandwritingQuestionContext {
   final int total;
   final QuestionState state;
   final Set<int> correctOptionIndexes;
+  final bool canEnterSequence;
 
   bool get canGoBack => index > 0;
-  bool get canGoForward => index >= 0 && index < total - 1;
+  bool get canGoForward =>
+      canEnterSequence || (index >= 0 && index < total - 1);
 }
 
 typedef NavigateCanvasQuestion = FutureOr<HandwritingQuestionContext?> Function(
-  int offset,
-);
+    int offset);
 typedef OpenCanvasNavigator = FutureOr<HandwritingQuestionContext?> Function(
-  BuildContext context,
-);
+    BuildContext context);
 typedef CanvasTextNoteChanged = void Function(Question question, String note);
 typedef CanvasQuestionChanged = void Function(Question question);
 typedef CanvasMasteryChanged = void Function(
-  Question question,
-  Mastery mastery,
-);
+    Question question, Mastery mastery);
 typedef CanvasAnswerSubmitted = void Function(
-  Question question,
-  Set<int> selectedIndexes,
-);
+    Question question, Set<int> selectedIndexes);
 typedef CanvasAnswerCleared = void Function(Question question);
 
 class _ClipboardCard {
@@ -252,9 +306,13 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   bool positionAnalysisAfterMeasure = false;
   Size viewport = Size.zero;
   Timer? saveTimer;
+  Future<void>? saveInProgress;
+  bool savePending = false;
   late final AnimationController viewPanController;
   Offset viewPanStart = Offset.zero;
   Offset viewPanEnd = Offset.zero;
+  double viewScaleStart = 1;
+  double viewScaleEnd = 1;
 
   final cardKeys = <String, GlobalKey>{};
   final cardHeights = <String, double>{};
@@ -296,6 +354,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   int strokeSerial = 0;
   int cardSerial = 0;
   int inkRevision = 0;
+  final inkPictureCache = _InkPictureCache();
 
   HandwritingDocument get doc => document!;
   WritingToolSettings get writingTools => toolSettings!;
@@ -310,10 +369,14 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     )..addListener(() {
         if (!mounted || document == null) return;
         setState(() {
-          doc.viewOffset = Offset.lerp(
-            viewPanStart,
-            viewPanEnd,
-            Curves.easeOutCubic.transform(viewPanController.value),
+          final progress = Curves.easeOutCubic.transform(
+            viewPanController.value,
+          );
+          doc.viewOffset = Offset.lerp(viewPanStart, viewPanEnd, progress)!;
+          doc.viewScale = ui.lerpDouble(
+            viewScaleStart,
+            viewScaleEnd,
+            progress,
           )!;
         });
       });
@@ -329,6 +392,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     saveTimer?.cancel();
     secondaryStylusButtonTimer?.cancel();
     viewPanController.dispose();
+    inkPictureCache.dispose();
     _nativeChannel.setMethodCallHandler(null);
     super.dispose();
   }
@@ -349,7 +413,11 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   Future<void> _closeCanvas() async {
     if (allowPop) return;
     saveTimer?.cancel();
-    await _saveNow();
+    try {
+      await _saveNow();
+    } catch (_) {
+      return;
+    }
     if (!mounted) return;
     setState(() => allowPop = true);
     Navigator.of(context).pop();
@@ -375,8 +443,9 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
           if (option.isNotEmpty) option.codeUnitAt(0) - 65,
       };
     });
-    final hasSavedCanvas =
-        widget.storage.hasHandwriting(questionContext.question.id);
+    final hasSavedCanvas = widget.storage.hasHandwriting(
+      questionContext.question.id,
+    );
     final loadedTools =
         toolSettings ?? await widget.storage.loadWritingToolSettings();
     final loaded = await widget.storage.loadHandwriting(
@@ -412,26 +481,50 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   }
 
   Future<void> _saveNow() async {
-    final current = document;
-    if (current == null) return;
+    final activeSave = saveInProgress;
+    if (activeSave != null) {
+      savePending = true;
+      await activeSave;
+      return;
+    }
+    final operation = _performSaveLoop();
+    saveInProgress = operation;
     try {
-      await Future.wait([
-        widget.storage.saveHandwriting(current),
-        widget.storage.saveWritingToolSettings(writingTools),
-      ]);
+      await operation;
+    } finally {
+      if (identical(saveInProgress, operation)) saveInProgress = null;
+    }
+  }
+
+  Future<void> _performSaveLoop() async {
+    try {
+      do {
+        savePending = false;
+        final current = document;
+        if (current == null) break;
+        await Future.wait([
+          widget.storage.saveHandwriting(current),
+          widget.storage.saveWritingToolSettings(writingTools),
+        ]);
+      } while (savePending);
       if (mounted && saveFailed) setState(() => saveFailed = false);
-    } catch (_) {
+    } catch (error, stackTrace) {
       if (mounted && !saveFailed) {
         setState(() => saveFailed = true);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('书写内容保存失败，请稍后重试')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('书写内容保存失败，请稍后重试')));
       }
+      Error.throwWithStackTrace(error, stackTrace);
     }
   }
 
   Future<void> _navigate(int offset) async {
-    await _saveNow();
+    try {
+      await _saveNow();
+    } catch (_) {
+      return;
+    }
     final next = await widget.onNavigate(offset);
     if (next == null || !mounted) return;
     questionContext = next;
@@ -439,7 +532,11 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   }
 
   Future<void> _openNavigator() async {
-    await _saveNow();
+    try {
+      await _saveNow();
+    } catch (_) {
+      return;
+    }
     if (!mounted) return;
     final next = await widget.onOpenNavigator(context);
     if (next == null || !mounted) return;
@@ -520,9 +617,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   void _completeStrokePoint(InkStroke stroke) {
     if (stroke.points.length != 1) return;
     final point = stroke.points.single;
-    stroke.points.add(
-      InkPoint(point.x + .01, point.y + .01, point.pressure),
-    );
+    stroke.points.add(InkPoint(point.x + .01, point.y + .01, point.pressure));
   }
 
   void _handleStylusButtons(PointerEvent event) {
@@ -630,19 +725,14 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
           activeStroke = _newStroke(
             event,
             erase: erase,
-            points: [
-              previousPoint,
-              InkPoint(point.dx, point.dy, pressure),
-            ],
+            points: [previousPoint, InkPoint(point.dx, point.dy, pressure)],
           );
         });
         return;
       }
       if ((point - previous.offset).distance < .45 / doc.viewScale) return;
       setState(() {
-        activeStroke!.points.add(
-          InkPoint(point.dx, point.dy, pressure),
-        );
+        activeStroke!.points.add(InkPoint(point.dx, point.dy, pressure));
       });
       return;
     }
@@ -735,6 +825,16 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     return bounds.contains(globalPosition);
   }
 
+  void _startRedo(Question question, {Set<int> options = const <int>{}}) {
+    widget.onClearAnswer(question);
+    setState(() {
+      pendingOptions = options;
+      analysisVisible = false;
+      doc.analysisVisible = false;
+    });
+    _scheduleSave();
+  }
+
   bool _maybeAnswerQuestion(Offset globalPosition) {
     final question = questionContext.question;
     final state = questionContext.state;
@@ -749,8 +849,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     }
     if (state.lastCorrect != null) {
       if (_keyContains(questionRetryKey, globalPosition)) {
-        widget.onClearAnswer(question);
-        setState(() => pendingOptions = {});
+        _startRedo(question);
         return true;
       }
       final selected = {
@@ -761,8 +860,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
         if (!_keyContains(questionOptionKeys[index], globalPosition)) continue;
         if (!selected.contains(index)) return true;
         selected.remove(index);
-        widget.onClearAnswer(question);
-        setState(() => pendingOptions = selected);
+        _startRedo(question, options: selected);
         return true;
       }
       return false;
@@ -958,8 +1056,12 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
         ..clear()
         ..addAll(
           doc.strokes.where((stroke) {
-            if (stroke.erase || !bounds.overlaps(stroke.bounds)) return false;
-            return stroke.points.any((point) => path.contains(point.offset));
+            if (stroke.erase || !bounds.overlaps(stroke.bounds)) {
+              return false;
+            }
+            return stroke.points.any(
+              (point) => path.contains(point.offset),
+            );
           }).map((stroke) => stroke.id),
         );
       selectedCards.clear();
@@ -984,8 +1086,9 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   void _moveSelection(Offset delta) {
     setState(() {
       for (final original in selectionOriginalStrokes) {
-        final index =
-            doc.strokes.indexWhere((stroke) => stroke.id == original.id);
+        final index = doc.strokes.indexWhere(
+          (stroke) => stroke.id == original.id,
+        );
         if (index >= 0) doc.strokes[index] = original.translated(delta);
       }
       for (final entry in selectionOriginalCards.entries) {
@@ -1043,9 +1146,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
       for (final stroke in doc.strokes)
         if (selectedStrokeIds.contains(stroke.id)) stroke,
     ];
-    selectionOriginalCards = {
-      for (final id in selectedCards) id: _card(id),
-    };
+    selectionOriginalCards = {for (final id in selectedCards) id: _card(id)};
   }
 
   void _updateResizeSelection(Offset screenDelta) {
@@ -1103,8 +1204,9 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     };
     setState(() {
       for (final original in selectionOriginalStrokes) {
-        final index =
-            doc.strokes.indexWhere((stroke) => stroke.id == original.id);
+        final index = doc.strokes.indexWhere(
+          (stroke) => stroke.id == original.id,
+        );
         if (index >= 0) {
           doc.strokes[index] = original.scaledXY(horizontal, vertical, anchor);
         }
@@ -1285,10 +1387,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     final visualWidth = card.width * card.scaleX;
     final visualHeight = cardHeight * card.scaleY;
     final scale = math
-        .min(
-          (viewport.width - 88) / visualWidth,
-          usableHeight / visualHeight,
-        )
+        .min((viewport.width - 88) / visualWidth, usableHeight / visualHeight)
         .clamp(.28, 1.15);
     setState(() {
       doc.viewScale = scale;
@@ -1338,17 +1437,26 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
       viewport.width - 12,
       viewport.height - (landscape ? 12 : 76),
     );
-    if (visibleRect.overlaps(screenRect)) return;
-
-    var targetX = doc.viewOffset.dx;
-    if (screenRect.right <= visibleRect.left ||
-        screenRect.left >= visibleRect.right) {
-      targetX = visibleRect.left + 16 - analysis.left * doc.viewScale;
+    if (visibleRect.contains(screenRect.topLeft) &&
+        visibleRect.contains(screenRect.bottomRight)) {
+      return;
     }
-    final desiredTop = math.min(260.0, visibleRect.height * .42);
-    final targetY = visibleRect.top + desiredTop - analysis.top * doc.viewScale;
+
+    const margin = 16.0;
+    final fitScale = math.min(
+      (visibleRect.width - margin * 2) / analysis.width,
+      (visibleRect.height - margin * 2) / analysis.height,
+    );
+    final targetScale =
+        math.min(doc.viewScale, fitScale).clamp(.2, 4).toDouble();
+    final targetX = visibleRect.left +
+        (visibleRect.width - analysis.width * targetScale) / 2 -
+        analysis.left * targetScale;
+    final targetY = visibleRect.top + margin - analysis.top * targetScale;
     viewPanStart = doc.viewOffset;
     viewPanEnd = Offset(targetX, targetY);
+    viewScaleStart = doc.viewScale;
+    viewScaleEnd = targetScale;
     viewPanController
       ..reset()
       ..forward();
@@ -1356,9 +1464,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
 
   Rect _canvasContentBounds({required bool includeTextNote}) {
     final visibleCards = _visibleCardIds
-        .where(
-          (id) => includeTextNote || _cardSource(id) != 'note',
-        )
+        .where((id) => includeTextNote || _cardSource(id) != 'note')
         .toList(growable: false);
     var bounds = _cardRect(visibleCards.first);
     for (final id in visibleCards.skip(1)) {
@@ -1443,10 +1549,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
       builder: (context) => Stack(
         fit: StackFit.expand,
         children: [
-          const ModalBarrier(
-            dismissible: false,
-            color: Color(0x4d0f172a),
-          ),
+          const ModalBarrier(dismissible: false, color: Color(0x4d0f172a)),
           Center(
             child: Opacity(
               opacity: .01,
@@ -1507,16 +1610,16 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
         pdf: pdf,
       );
       if (mounted && saved) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(pdf ? 'PDF 已导出' : '图片已导出')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(pdf ? 'PDF 已导出' : '图片已导出')));
       }
     } catch (_) {
       if (entry.mounted) entry.remove();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('画布导出失败，请稍后重试')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('画布导出失败，请稍后重试')));
       }
     } finally {
       if (entry.mounted) entry.remove();
@@ -1547,6 +1650,11 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     );
     if (confirmed != true || !mounted) return;
     saveTimer?.cancel();
+    try {
+      await _saveNow();
+    } catch (_) {
+      return;
+    }
     await widget.storage.deleteHandwriting(questionContext.question.id);
     if (!mounted) return;
     setState(() {
@@ -1563,6 +1671,51 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
       positionAnalysisAfterMeasure = true;
       cardHeights.clear();
     });
+  }
+
+  Future<void> _reloadCanvas() async {
+    if (loading) return;
+    saveTimer?.cancel();
+    try {
+      await _saveNow();
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
+    _clearTransientCanvasState();
+    inkPictureCache.clear();
+    await _loadQuestion();
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('画布已重新载入，书写内容完整保留')));
+  }
+
+  void _clearTransientCanvasState() {
+    viewPanController.stop();
+    activePointers.clear();
+    pointerOrigins.clear();
+    ignoredTouchPointers.clear();
+    activeGestureStrokes.clear();
+    selectedStrokeIds.clear();
+    selectedCards.clear();
+    lassoPoints.clear();
+    selectionOriginalStrokes = [];
+    selectionOriginalCards = {};
+    drawingPointer = null;
+    activeStroke = null;
+    stylusActive = false;
+    stylusCursor = null;
+    pinchStartDistance = null;
+    pinchStartScale = null;
+    pinchAnchorWorld = null;
+    movingSelection = false;
+    selectionMoveOrigin = null;
+    selectionResizeBounds = null;
+    selectionResizeHandle = null;
+    pressureEraserActive = false;
+    primaryStylusButtonWasPressed = false;
+    secondaryStylusButtonWasPressed = false;
   }
 
   bool _maybeEditTextCard(Offset local) {
@@ -1713,9 +1866,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                     setSheetState,
                   ),
                 ),
-                Text(
-                  '压感强度 ${(preset.pressureStrength * 100).round()}%',
-                ),
+                Text('压感强度 ${(preset.pressureStrength * 100).round()}%'),
                 Slider(
                   min: 0,
                   max: 1,
@@ -1779,20 +1930,16 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                   min: 8,
                   max: 240,
                   value: width,
-                  onChanged: (value) => updateEraser(
-                    setSheetState,
-                    () => width = value,
-                  ),
+                  onChanged: (value) =>
+                      updateEraser(setSheetState, () => width = value),
                 ),
                 Text('大小压感 ${(pressure * 100).round()}%'),
                 Slider(
                   min: 0,
                   max: 1,
                   value: pressure,
-                  onChanged: (value) => updateEraser(
-                    setSheetState,
-                    () => pressure = value,
-                  ),
+                  onChanged: (value) =>
+                      updateEraser(setSheetState, () => pressure = value),
                 ),
                 const Text(
                   '数值越高，轻按和重按时的橡皮大小差异越明显。',
@@ -1802,9 +1949,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('重压临时擦除'),
-                  subtitle: const Text(
-                    '用力下压时，本次落笔临时切换为橡皮，提笔后恢复画笔',
-                  ),
+                  subtitle: const Text('用力下压时，本次落笔临时切换为橡皮，提笔后恢复画笔'),
                   value: pressureEraseEnabled,
                   onChanged: (value) => updateEraser(
                     setSheetState,
@@ -1812,9 +1957,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                   ),
                 ),
                 if (pressureEraseEnabled) ...[
-                  Text(
-                    '触发压力 ${(pressureEraseThreshold * 100).round()}%',
-                  ),
+                  Text('触发压力 ${(pressureEraseThreshold * 100).round()}%'),
                   Slider(
                     min: .55,
                     max: .95,
@@ -1926,8 +2069,10 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
               Text(
                 '${questionContext.displayPosition == null ? '#—' : '#${questionContext.displayPosition}'} · '
                 '${questionContext.question.source.trim().isEmpty ? '题库题' : questionContext.question.source}',
-                style:
-                    const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
               Text(
                 questionContext.categoryPath,
@@ -1993,6 +2138,16 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                       title: Text(mastery.label),
                     ),
                   ),
+                if (questionContext.state.mastery != Mastery.notStarted) ...[
+                  const PopupMenuDivider(),
+                  const PopupMenuItem(
+                    value: 'not_started',
+                    child: ListTile(
+                      leading: Icon(Icons.remove_circle_outline_rounded),
+                      title: Text('清除状态'),
+                    ),
+                  ),
+                ],
               ],
               icon: const Icon(Icons.fact_check_outlined, color: _text),
             ),
@@ -2029,6 +2184,12 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Icon(Icons.ios_share_rounded),
+            ),
+            IconButton(
+              key: const ValueKey('canvas-reload'),
+              tooltip: '重新载入画布',
+              onPressed: loading ? null : () => unawaited(_reloadCanvas()),
+              icon: const Icon(Icons.refresh_rounded),
             ),
             IconButton(
               key: const ValueKey('canvas-reset-current'),
@@ -2152,13 +2313,13 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
                 child: CustomPaint(
                   key: const ValueKey('handwriting-ink-layer'),
                   painter: _InkPainter(
-                    strokes: liveErasing
-                        ? [...doc.strokes, ...liveStrokes]
-                        : doc.strokes,
+                    strokes: doc.strokes,
                     offset: doc.viewOffset,
                     scale: doc.viewScale,
                     revision: inkRevision,
                     live: liveErasing,
+                    cache: inkPictureCache,
+                    overlayStrokes: liveErasing ? liveStrokes : const [],
                   ),
                 ),
               ),
@@ -2355,10 +2516,7 @@ class _ToolButton extends StatelessWidget {
 }
 
 class _SelectionActions extends StatelessWidget {
-  const _SelectionActions({
-    required this.onDuplicate,
-    required this.onDelete,
-  });
+  const _SelectionActions({required this.onDuplicate, required this.onDelete});
 
   final VoidCallback onDuplicate;
   final VoidCallback onDelete;
@@ -2516,6 +2674,7 @@ class HandwritingExportSurface extends StatelessWidget {
     required this.includeTextNote,
     required this.offset,
     required this.scale,
+    this.cardKeys,
   });
 
   final Size size;
@@ -2525,6 +2684,7 @@ class HandwritingExportSurface extends StatelessWidget {
   final bool includeTextNote;
   final Offset offset;
   final double scale;
+  final Map<String, GlobalKey>? cardKeys;
 
   @override
   Widget build(BuildContext context) => SizedBox(
@@ -2542,6 +2702,7 @@ class HandwritingExportSurface extends StatelessWidget {
                 ),
               ),
               _WorldCard(
+                cardKey: cardKeys?['question'],
                 state: document.questionCard,
                 offset: offset,
                 scale: scale,
@@ -2550,6 +2711,7 @@ class HandwritingExportSurface extends StatelessWidget {
               ),
               if (analysisVisible)
                 _WorldCard(
+                  cardKey: cardKeys?['analysis'],
                   state: document.analysisCard,
                   offset: offset,
                   scale: scale,
@@ -2558,6 +2720,7 @@ class HandwritingExportSurface extends StatelessWidget {
                 ),
               if (includeTextNote)
                 _WorldCard(
+                  cardKey: cardKeys?['note'],
                   state: document.noteCard,
                   offset: offset,
                   scale: scale,
@@ -2568,6 +2731,7 @@ class HandwritingExportSurface extends StatelessWidget {
                 if ((copy.source != 'analysis' || analysisVisible) &&
                     (copy.source != 'note' || includeTextNote))
                   _WorldCard(
+                    cardKey: cardKeys?[copy.id],
                     state: copy.state,
                     offset: offset,
                     scale: scale,
@@ -2626,19 +2790,6 @@ class _QuestionCanvasCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           MathContent(question.stem, selectable: false),
-          if (question.assets.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            for (final reference in question.assets)
-              if (_questionAssetPath(reference) case final path?)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Image.asset(
-                    path,
-                    fit: BoxFit.contain,
-                    errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                  ),
-                ),
-          ],
           for (var index = 0; index < question.options.length; index++)
             Container(
               key: optionKeys != null && index < optionKeys!.length
@@ -2709,8 +2860,10 @@ class _QuestionCanvasCard extends StatelessWidget {
               alignment: Alignment.centerRight,
               child: Container(
                 key: submitKey,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: pendingOptions.isEmpty
                       ? const Color(0xffcbd5e1)
@@ -2745,10 +2898,12 @@ class _QuestionCanvasCard extends StatelessWidget {
                 if (retryKey != null)
                   Container(
                     key: retryKey,
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
                     child: const Text(
-                      '重新作答',
+                      '开始重做',
                       style: TextStyle(
                         color: _primary,
                         fontWeight: FontWeight.w700,
@@ -2816,11 +2971,7 @@ class _TextNoteCanvasCard extends StatelessWidget {
           child: text.trim().isEmpty
               ? const Text(
                   '记录思路、易错点……',
-                  style: TextStyle(
-                    height: 1.65,
-                    fontSize: 17,
-                    color: _muted,
-                  ),
+                  style: TextStyle(height: 1.65, fontSize: 17, color: _muted),
                 )
               : MathContent(
                   text,
@@ -2903,12 +3054,6 @@ class _CanvasCard extends StatelessWidget {
       );
 }
 
-String? _questionAssetPath(String reference) {
-  final match =
-      RegExp(r'^asset://sha256/([a-f0-9]{64})$').firstMatch(reference);
-  return match == null ? null : 'assets/question_images/${match.group(1)}.png';
-}
-
 class _CanvasBackgroundPainter extends CustomPainter {
   const _CanvasBackgroundPainter({
     required this.background,
@@ -2962,6 +3107,8 @@ class _InkPainter extends CustomPainter {
     required this.scale,
     this.revision = 0,
     this.live = false,
+    this.cache,
+    this.overlayStrokes = const [],
   });
 
   final List<InkStroke> strokes;
@@ -2969,67 +3116,32 @@ class _InkPainter extends CustomPainter {
   final double scale;
   final int revision;
   final bool live;
+  final _InkPictureCache? cache;
+  final List<InkStroke> overlayStrokes;
+
+  int get cacheBuildCount => cache?.buildCount ?? 0;
 
   @override
   void paint(Canvas canvas, Size size) {
-    canvas.saveLayer(Offset.zero & size, Paint());
     canvas.translate(offset.dx, offset.dy);
     canvas.scale(scale);
-    for (final stroke in strokes) {
-      if (stroke.points.length < 2) continue;
-      final paint = Paint()
-        ..color = Color(stroke.color)
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round
-        ..style = PaintingStyle.stroke
-        ..blendMode = stroke.erase ? BlendMode.clear : BlendMode.srcOver;
-      if (stroke.points.length == 2) {
-        final start = stroke.points.first;
-        final end = stroke.points.last;
-        paint.strokeWidth = stroke.width *
-            _pressureScale(
-              (start.pressure + end.pressure) / 2,
-              stroke.pressureStrength,
-            );
-        canvas.drawLine(start.offset, end.offset, paint);
-        continue;
+    final picture = cache?.pictureFor(strokes, revision);
+    if (picture != null) {
+      if (overlayStrokes.isNotEmpty) {
+        canvas.saveLayer(
+          _inkBounds([...strokes, ...overlayStrokes]),
+          Paint(),
+        );
       }
-      var segmentStart = stroke.points.first.offset;
-      for (var index = 1; index < stroke.points.length - 1; index++) {
-        final control = stroke.points[index];
-        final next = stroke.points[index + 1];
-        final segmentEnd = (control.offset + next.offset) / 2;
-        paint.strokeWidth = stroke.width *
-            _pressureScale(
-              (stroke.points[index - 1].pressure +
-                      control.pressure +
-                      next.pressure) /
-                  3,
-              stroke.pressureStrength,
-            );
-        final path = Path()
-          ..moveTo(segmentStart.dx, segmentStart.dy)
-          ..quadraticBezierTo(
-            control.x,
-            control.y,
-            segmentEnd.dx,
-            segmentEnd.dy,
-          );
-        canvas.drawPath(path, paint);
-        segmentStart = segmentEnd;
+      canvas.drawPicture(picture);
+      if (overlayStrokes.isNotEmpty) {
+        _paintInkStrokes(canvas, overlayStrokes);
+        canvas.restore();
       }
-      final last = stroke.points.last;
-      final beforeLast = stroke.points[stroke.points.length - 2];
-      paint.strokeWidth = stroke.width *
-          _pressureScale(
-            (beforeLast.pressure + last.pressure) / 2,
-            stroke.pressureStrength,
-          );
-      final tail = Path()
-        ..moveTo(segmentStart.dx, segmentStart.dy)
-        ..quadraticBezierTo(last.x, last.y, last.x, last.y);
-      canvas.drawPath(tail, paint);
+      return;
     }
+    canvas.saveLayer(_inkBounds(strokes), Paint());
+    _paintInkStrokes(canvas, strokes);
     canvas.restore();
   }
 
@@ -3040,6 +3152,104 @@ class _InkPainter extends CustomPainter {
       oldDelegate.revision != revision ||
       oldDelegate.offset != offset ||
       oldDelegate.scale != scale;
+}
+
+class _InkPictureCache {
+  int revision = -1;
+  int buildCount = 0;
+  ui.Picture? picture;
+
+  ui.Picture? pictureFor(List<InkStroke> strokes, int nextRevision) {
+    if (revision == nextRevision && picture != null) return picture;
+    picture?.dispose();
+    revision = nextRevision;
+    if (strokes.isEmpty) {
+      picture = null;
+      return null;
+    }
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder, _inkBounds(strokes));
+    canvas.saveLayer(_inkBounds(strokes), Paint());
+    _paintInkStrokes(canvas, strokes);
+    canvas.restore();
+    picture = recorder.endRecording();
+    buildCount += 1;
+    return picture;
+  }
+
+  void clear() {
+    picture?.dispose();
+    picture = null;
+    revision = -1;
+  }
+
+  void dispose() => clear();
+}
+
+Rect _inkBounds(List<InkStroke> strokes) {
+  Rect? bounds;
+  var padding = 1.0;
+  for (final stroke in strokes) {
+    padding = math.max(padding, stroke.width * 2);
+    for (final point in stroke.points) {
+      final rect = Rect.fromCircle(center: point.offset, radius: padding);
+      bounds = bounds == null ? rect : bounds.expandToInclude(rect);
+    }
+  }
+  return bounds ?? const Rect.fromLTWH(0, 0, 1, 1);
+}
+
+void _paintInkStrokes(Canvas canvas, List<InkStroke> strokes) {
+  for (final stroke in strokes) {
+    if (stroke.points.length < 2) continue;
+    final paint = Paint()
+      ..color = Color(stroke.color)
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..style = PaintingStyle.stroke
+      ..blendMode = stroke.erase ? BlendMode.clear : BlendMode.srcOver;
+    if (stroke.points.length == 2) {
+      final start = stroke.points.first;
+      final end = stroke.points.last;
+      paint.strokeWidth = stroke.width *
+          _pressureScale(
+            (start.pressure + end.pressure) / 2,
+            stroke.pressureStrength,
+          );
+      canvas.drawLine(start.offset, end.offset, paint);
+      continue;
+    }
+    var segmentStart = stroke.points.first.offset;
+    for (var index = 1; index < stroke.points.length - 1; index++) {
+      final control = stroke.points[index];
+      final next = stroke.points[index + 1];
+      final segmentEnd = (control.offset + next.offset) / 2;
+      paint.strokeWidth = stroke.width *
+          _pressureScale(
+            (stroke.points[index - 1].pressure +
+                    control.pressure +
+                    next.pressure) /
+                3,
+            stroke.pressureStrength,
+          );
+      final path = Path()
+        ..moveTo(segmentStart.dx, segmentStart.dy)
+        ..quadraticBezierTo(control.x, control.y, segmentEnd.dx, segmentEnd.dy);
+      canvas.drawPath(path, paint);
+      segmentStart = segmentEnd;
+    }
+    final last = stroke.points.last;
+    final beforeLast = stroke.points[stroke.points.length - 2];
+    paint.strokeWidth = stroke.width *
+        _pressureScale(
+          (beforeLast.pressure + last.pressure) / 2,
+          stroke.pressureStrength,
+        );
+    final tail = Path()
+      ..moveTo(segmentStart.dx, segmentStart.dy)
+      ..quadraticBezierTo(last.x, last.y, last.x, last.y);
+    canvas.drawPath(tail, paint);
+  }
 }
 
 class _EraserCursorPainter extends CustomPainter {

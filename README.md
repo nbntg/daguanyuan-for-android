@@ -34,7 +34,7 @@ Android 应用与原站之间的收藏、掌握状态同步，需要配合“大
 
 文件格式：
 
-- Android 应用导出：`format: "daguan-android-progress"`，`version: 1`，题目标记位于根节点 `states`。
+- Android 应用导出：`format: "daguan-android-progress"`，`version: 2`，题目标记及近期复习时间位于根节点 `states`。
 - 浏览器插件导出：`format: "daguan-browser-sync"`，`version: 1`，题目标记位于 `question_states.states`。
 
 浏览器插件下载地址：
@@ -70,7 +70,7 @@ flutter build apk --release
 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-Windows 用户也可以双击 `构建APK.cmd`，脚本会执行检查并生成 `daguan-math-community-v1.1.0.apk`。
+Windows 用户也可以双击 `构建APK.cmd`。脚本会执行检查，在源码目录的上一层创建 `daguan-math-v1.1.4-release` 发布目录并放入 APK，随后清理源码目录中的临时 `build`。有发布密钥时 APK 名为 `daguan-math-v1.1.4.apk`，否则名为 `daguan-math-community-v1.1.4.apk`。
 
 ### APK 签名说明
 
@@ -97,7 +97,6 @@ assets/                  离线题库、章节、空白初始进度和题图
 lib/                     Flutter 应用源码
 test/                    自动化测试和视觉基准
 tool/verify_project.js   离线题库与隐私边界校验
-docs/adr/                关键架构决策
 ```
 
 ## 隐私

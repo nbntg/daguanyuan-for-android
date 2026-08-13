@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/services.dart';
 
@@ -19,17 +20,20 @@ class LocalStorage {
     final filesDir = await _channel.invokeMethod<String>('getFilesDir');
     if (filesDir == null) throw StateError('无法获取应用存储目录');
     _progressFile = File('$filesDir${Platform.pathSeparator}progress.json');
-    _writingToolsFile =
-        File('$filesDir${Platform.pathSeparator}writing_tools.json');
-    _handwritingDirectory =
-        Directory('$filesDir${Platform.pathSeparator}handwriting');
+    _writingToolsFile = File(
+      '$filesDir${Platform.pathSeparator}writing_tools.json',
+    );
+    _handwritingDirectory = Directory(
+      '$filesDir${Platform.pathSeparator}handwriting',
+    );
     if (!_handwritingDirectory.existsSync()) {
       await _handwritingDirectory.create(recursive: true);
     }
     _initialized = true;
     if (!_progressFile.existsSync()) {
-      final initial =
-          await rootBundle.loadString('assets/initial_progress.json');
+      final initial = await rootBundle.loadString(
+        'assets/initial_progress.json',
+      );
       await _progressFile.writeAsString(initial, flush: true);
     }
     return decodeObject(await _progressFile.readAsString());
@@ -116,10 +120,7 @@ class LocalStorage {
     _ensureInitialized();
     final file = _handwritingFile(questionId);
     if (!file.existsSync()) {
-      return HandwritingDocument.empty(
-        questionId,
-        textNote: fallbackTextNote,
-      );
+      return HandwritingDocument.empty(questionId, textNote: fallbackTextNote);
     }
     try {
       return HandwritingDocument.fromJson(
@@ -128,10 +129,7 @@ class LocalStorage {
         fallbackTextNote: fallbackTextNote,
       );
     } on FormatException {
-      return HandwritingDocument.empty(
-        questionId,
-        textNote: fallbackTextNote,
-      );
+      return HandwritingDocument.empty(questionId, textNote: fallbackTextNote);
     }
   }
 
@@ -160,10 +158,16 @@ class LocalStorage {
     _ensureInitialized();
     final file = _handwritingFile(document.questionId);
     final temporary = File('${file.path}.tmp');
-    await temporary.writeAsString(
-      jsonEncode(document.toJson()),
-      flush: true,
-    );
+    final useBackgroundEncoding =
+        document.strokes.length >= 80 || document.undoHistory.length >= 40;
+    if (!useBackgroundEncoding) {
+      temporary.writeAsStringSync(jsonEncode(document.toJson()), flush: true);
+      if (file.existsSync()) file.deleteSync();
+      temporary.renameSync(file.path);
+      return;
+    }
+    final encoded = await Isolate.run(() => jsonEncode(document.toJson()));
+    await temporary.writeAsString(encoded, flush: true);
     if (file.existsSync()) await file.delete();
     await temporary.rename(file.path);
   }
@@ -171,7 +175,7 @@ class LocalStorage {
   Future<void> deleteHandwriting(int questionId) async {
     _ensureInitialized();
     final file = _handwritingFile(questionId);
-    if (file.existsSync()) await file.delete();
+    if (file.existsSync()) file.deleteSync();
   }
 
   Future<WritingToolSettings> loadWritingToolSettings() async {
@@ -191,12 +195,9 @@ class LocalStorage {
   Future<void> saveWritingToolSettings(WritingToolSettings settings) async {
     _ensureInitialized();
     final temporary = File('${_writingToolsFile.path}.tmp');
-    await temporary.writeAsString(
-      jsonEncode(settings.toJson()),
-      flush: true,
-    );
-    if (_writingToolsFile.existsSync()) await _writingToolsFile.delete();
-    await temporary.rename(_writingToolsFile.path);
+    temporary.writeAsStringSync(jsonEncode(settings.toJson()), flush: true);
+    if (_writingToolsFile.existsSync()) _writingToolsFile.deleteSync();
+    temporary.renameSync(_writingToolsFile.path);
   }
 
   Future<void> clearAllUserData() async {
@@ -208,7 +209,7 @@ class LocalStorage {
     await _handwritingDirectory.create(recursive: true);
     await save({
       'format': 'daguan-android-progress',
-      'version': 1,
+      'version': 2,
       'states': <String, dynamic>{},
       'events': <dynamic>[],
       'lastStudy': null,

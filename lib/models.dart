@@ -101,6 +101,8 @@ class QuestionState {
     this.lastAttemptAt,
     this.favoriteOrigin,
     this.reviewOrigin,
+    this.practiceQueuedAt,
+    this.reviewAddedAt,
   });
 
   factory QuestionState.fromJson(Map<String, dynamic> json) => QuestionState(
@@ -108,8 +110,9 @@ class QuestionState {
         favorite: json['favorite'] as bool? ?? false,
         note: json['note'] as String? ?? '',
         updatedAt: json['updatedAt'] as String?,
-        selectedOptions:
-            List<String>.from(json['selectedOptions'] as List? ?? const []),
+        selectedOptions: List<String>.from(
+          json['selectedOptions'] as List? ?? const [],
+        ),
         lastCorrect: json['lastCorrect'] as bool?,
         wrongCount: json['wrongCount'] as int? ?? 0,
         inWrongBook: json['inWrongBook'] as bool? ?? false,
@@ -124,6 +127,8 @@ class QuestionState {
                 Map<String, dynamic>.from(json['reviewOrigin'] as Map),
               )
             : null,
+        practiceQueuedAt: json['practiceQueuedAt'] as String?,
+        reviewAddedAt: json['reviewAddedAt'] as String?,
       );
 
   Mastery mastery;
@@ -137,6 +142,8 @@ class QuestionState {
   String? lastAttemptAt;
   CollectionOrigin? favoriteOrigin;
   CollectionOrigin? reviewOrigin;
+  String? practiceQueuedAt;
+  String? reviewAddedAt;
 
   Map<String, dynamic> toJson() => {
         'mastery': mastery.value,
@@ -150,6 +157,8 @@ class QuestionState {
         'lastAttemptAt': lastAttemptAt,
         if (favoriteOrigin != null) 'favoriteOrigin': favoriteOrigin!.toJson(),
         if (reviewOrigin != null) 'reviewOrigin': reviewOrigin!.toJson(),
+        if (practiceQueuedAt != null) 'practiceQueuedAt': practiceQueuedAt,
+        if (reviewAddedAt != null) 'reviewAddedAt': reviewAddedAt,
       };
 }
 
