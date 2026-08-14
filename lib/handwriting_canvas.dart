@@ -241,6 +241,8 @@ typedef CanvasMasteryChanged = void Function(
 typedef CanvasAnswerSubmitted = void Function(
     Question question, Set<int> selectedIndexes);
 typedef CanvasAnswerCleared = void Function(Question question);
+typedef CanvasRestartRequested = Future<void> Function(
+    HandwritingQuestionContext context);
 
 class _ClipboardCard {
   const _ClipboardCard({required this.source, required this.state});
@@ -261,8 +263,8 @@ class _CanvasClipboard {
   final List<_ClipboardCard> cards;
 }
 
-class HandwritingCanvasPage extends StatefulWidget {
-  const HandwritingCanvasPage({
+class HandwritingCanvasSession extends StatefulWidget {
+  const HandwritingCanvasSession({
     super.key,
     required this.storage,
     required this.initialContext,
@@ -284,6 +286,118 @@ class HandwritingCanvasPage extends StatefulWidget {
   final CanvasMasteryChanged onSetMastery;
   final CanvasAnswerSubmitted onSubmitAnswer;
   final CanvasAnswerCleared onClearAnswer;
+
+  @override
+  State<HandwritingCanvasSession> createState() =>
+      _HandwritingCanvasSessionState();
+}
+
+class _HandwritingCanvasSessionState extends State<HandwritingCanvasSession> {
+  late HandwritingQuestionContext currentContext;
+  var generation = 0;
+  var restarting = false;
+  var showRestartMessage = false;
+
+  @override
+  void initState() {
+    super.initState();
+    currentContext = widget.initialContext;
+  }
+
+  Future<void> _restart(HandwritingQuestionContext context) async {
+    if (restarting) return;
+    setState(() {
+      currentContext = context;
+      restarting = true;
+    });
+    await WidgetsBinding.instance.endOfFrame;
+    PaintingBinding.instance.imageCache
+      ..clear()
+      ..clearLiveImages();
+    await Future<void>.delayed(const Duration(milliseconds: 160));
+    if (!mounted) return;
+    setState(() {
+      generation += 1;
+      restarting = false;
+      showRestartMessage = true;
+    });
+  }
+
+  void _canvasLoaded() {
+    if (!showRestartMessage) return;
+    showRestartMessage = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('画布已重新启动，当前位置和书写内容完整保留')));
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (restarting) {
+      return const Scaffold(
+        backgroundColor: _canvas,
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('正在恢复画布…'),
+            ],
+          ),
+        ),
+      );
+    }
+    return HandwritingCanvasPage(
+      key: ValueKey(generation),
+      storage: widget.storage,
+      initialContext: currentContext,
+      preserveLoadedViewport: generation > 0,
+      onRestart: _restart,
+      onLoaded: _canvasLoaded,
+      onNavigate: widget.onNavigate,
+      onOpenNavigator: widget.onOpenNavigator,
+      onTextNoteChanged: widget.onTextNoteChanged,
+      onToggleFavorite: widget.onToggleFavorite,
+      onSetMastery: widget.onSetMastery,
+      onSubmitAnswer: widget.onSubmitAnswer,
+      onClearAnswer: widget.onClearAnswer,
+    );
+  }
+}
+
+class HandwritingCanvasPage extends StatefulWidget {
+  const HandwritingCanvasPage({
+    super.key,
+    required this.storage,
+    required this.initialContext,
+    required this.onNavigate,
+    required this.onOpenNavigator,
+    required this.onTextNoteChanged,
+    required this.onToggleFavorite,
+    required this.onSetMastery,
+    required this.onSubmitAnswer,
+    required this.onClearAnswer,
+    this.preserveLoadedViewport = false,
+    this.onRestart,
+    this.onLoaded,
+  });
+
+  final LocalStorage storage;
+  final HandwritingQuestionContext initialContext;
+  final NavigateCanvasQuestion onNavigate;
+  final OpenCanvasNavigator onOpenNavigator;
+  final CanvasTextNoteChanged onTextNoteChanged;
+  final CanvasQuestionChanged onToggleFavorite;
+  final CanvasMasteryChanged onSetMastery;
+  final CanvasAnswerSubmitted onSubmitAnswer;
+  final CanvasAnswerCleared onClearAnswer;
+  final bool preserveLoadedViewport;
+  final CanvasRestartRequested? onRestart;
+  final VoidCallback? onLoaded;
 
   @override
   State<HandwritingCanvasPage> createState() => _HandwritingCanvasPageState();
@@ -384,7 +498,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
       if (status == AnimationStatus.completed) _scheduleSave();
     });
     _nativeChannel.setMethodCallHandler(_handleNativeCall);
-    _loadQuestion();
+    _loadQuestion(preserveViewport: widget.preserveLoadedViewport);
   }
 
   @override
@@ -423,7 +537,7 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
     Navigator.of(context).pop();
   }
 
-  Future<void> _loadQuestion() async {
+  Future<void> _loadQuestion({bool preserveViewport = false}) async {
     saveTimer?.cancel();
     setState(() {
       loading = true;
@@ -461,14 +575,18 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
       analysisVisible = loaded.analysisVisible;
       inkRevision += 1;
       tool = CanvasTool.pen;
-      fitAfterMeasure = loaded.viewOffset == Offset.zero;
-      positionAnalysisAfterMeasure = !hasSavedCanvas;
+      fitAfterMeasure = !preserveViewport && loaded.viewOffset == Offset.zero;
+      positionAnalysisAfterMeasure = !preserveViewport && !hasSavedCanvas;
       loading = false;
     });
     if (textNoteChanged) _scheduleSave();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || viewport.isEmpty) return;
-      if (loaded.viewOffset == Offset.zero && !fitAfterMeasure) {
+      if (!mounted) return;
+      widget.onLoaded?.call();
+      if (viewport.isEmpty) return;
+      if (!preserveViewport &&
+          loaded.viewOffset == Offset.zero &&
+          !fitAfterMeasure) {
         _fitQuestion();
       }
     });
@@ -1676,19 +1794,26 @@ class _HandwritingCanvasPageState extends State<HandwritingCanvasPage>
   Future<void> _reloadCanvas() async {
     if (loading) return;
     saveTimer?.cancel();
+    setState(() => loading = true);
     try {
       await _saveNow();
     } catch (_) {
+      if (mounted) setState(() => loading = false);
       return;
     }
     if (!mounted) return;
+    final restart = widget.onRestart;
+    if (restart != null) {
+      await restart(questionContext);
+      return;
+    }
     _clearTransientCanvasState();
     inkPictureCache.clear();
-    await _loadQuestion();
+    await _loadQuestion(preserveViewport: true);
     if (!mounted) return;
     ScaffoldMessenger.of(
       context,
-    ).showSnackBar(const SnackBar(content: Text('画布已重新载入，书写内容完整保留')));
+    ).showSnackBar(const SnackBar(content: Text('画布已重新载入，当前位置和书写内容完整保留')));
   }
 
   void _clearTransientCanvasState() {
@@ -3128,10 +3253,7 @@ class _InkPainter extends CustomPainter {
     final picture = cache?.pictureFor(strokes, revision);
     if (picture != null) {
       if (overlayStrokes.isNotEmpty) {
-        canvas.saveLayer(
-          _inkBounds([...strokes, ...overlayStrokes]),
-          Paint(),
-        );
+        canvas.saveLayer(_inkBounds([...strokes, ...overlayStrokes]), Paint());
       }
       canvas.drawPicture(picture);
       if (overlayStrokes.isNotEmpty) {

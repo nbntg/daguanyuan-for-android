@@ -70,7 +70,7 @@ flutter build apk --release
 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-Windows 用户也可以双击 `构建APK.cmd`。脚本会执行检查，在源码目录的上一层创建 `daguan-math-v1.1.4-release` 发布目录并放入 APK，随后清理源码目录中的临时 `build`。有发布密钥时 APK 名为 `daguan-math-v1.1.4.apk`，否则名为 `daguan-math-community-v1.1.4.apk`。
+Windows 用户也可以双击 `构建APK.cmd`。脚本会执行检查，在源码目录的上一层创建 `daguan-math-v1.1.5-release` 发布目录并放入 APK。源码目录中的 `build` 会保留以加快后续构建，但已被 Git 忽略，不会上传。有发布密钥时 APK 名为 `daguan-math-v1.1.5.apk`，否则名为 `daguan-math-community-v1.1.5.apk`。
 
 ### APK 签名说明
 

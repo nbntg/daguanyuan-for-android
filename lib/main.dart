@@ -3092,7 +3092,7 @@ class _QuestionDetailState extends State<QuestionDetail> {
     try {
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
-          builder: (context) => HandwritingCanvasPage(
+          builder: (context) => HandwritingCanvasSession(
             storage: widget.controller.storage,
             initialContext: initial,
             onNavigate: (offset) {

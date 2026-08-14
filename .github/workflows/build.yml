@@ -49,11 +49,11 @@ jobs:
 
       - name: Prepare artifact
         shell: powershell
-        run: Copy-Item build/app/outputs/flutter-apk/app-release.apk daguan-math-community-v1.1.4.apk
+        run: Copy-Item build/app/outputs/flutter-apk/app-release.apk daguan-math-community-v1.1.5.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: daguan-math-community-v1.1.4
-          path: daguan-math-community-v1.1.4.apk
+          name: daguan-math-community-v1.1.5
+          path: daguan-math-community-v1.1.5.apk
           if-no-files-found: error

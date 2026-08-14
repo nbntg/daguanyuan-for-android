@@ -2,9 +2,9 @@
 setlocal
 cd /d "%~dp0"
 
-set "release_dir=%~dp0..\daguan-math-v1.1.4-release"
-set "apk_name=daguan-math-community-v1.1.4.apk"
-if exist "android\key.properties" set "apk_name=daguan-math-v1.1.4.apk"
+set "release_dir=%~dp0..\daguan-math-v1.1.5-release"
+set "apk_name=daguan-math-community-v1.1.5.apk"
+if exist "android\key.properties" set "apk_name=daguan-math-v1.1.5.apk"
 
 where flutter.bat >nul 2>nul
 if errorlevel 1 goto flutter_missing
@@ -40,15 +40,11 @@ call flutter build apk --release
 if errorlevel 1 goto failed
 
 if not exist "build\app\outputs\flutter-apk\app-release.apk" goto failed
+echo [6/6] Copying release APK...
 if not exist "%release_dir%" mkdir "%release_dir%"
 if errorlevel 1 goto failed
 copy /y "build\app\outputs\flutter-apk\app-release.apk" "%release_dir%\%apk_name%" >nul
 if errorlevel 1 goto failed
-
-echo [6/6] Cleaning temporary build files...
-call flutter clean
-if errorlevel 1 goto cleanup_failed
-if exist "build" goto cleanup_failed
 
 echo.
 echo Build complete:
@@ -67,14 +63,6 @@ exit /b 1
 :java_missing
 echo.
 echo Java was not found. Install JDK 17 and add it to PATH.
-echo.
-pause
-exit /b 1
-
-:cleanup_failed
-echo.
-echo APK was created, but the temporary build folder could not be removed.
-echo %release_dir%\%apk_name%
 echo.
 pause
 exit /b 1

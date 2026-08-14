@@ -256,7 +256,7 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: HandwritingCanvasPage(
+          home: HandwritingCanvasSession(
             storage: storage,
             initialContext: HandwritingQuestionContext(
               question: question,
@@ -390,6 +390,11 @@ void main() {
       final dynamic finalInkPainter = finalInkLayer.painter;
       expect((finalInkPainter.strokes as List), hasLength(3));
       expect((finalInkPainter.strokes as List).last.erase, isFalse);
+      final stateBeforeRestart = tester.state(
+        find.byType(HandwritingCanvasPage),
+      );
+      final offsetBeforeRestart = finalInkPainter.offset as Offset;
+      final scaleBeforeRestart = finalInkPainter.scale as double;
       final firstRecorder = ui.PictureRecorder();
       finalInkPainter.paint(
         Canvas(firstRecorder),
@@ -408,17 +413,42 @@ void main() {
       final reloadCanvas = tester
           .widget<IconButton>(find.byKey(const ValueKey('canvas-reload')))
           .onPressed!;
-      await tester.runAsync(() async {
-        reloadCanvas();
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-      });
-      await tester.pumpAndSettle();
-      expect(find.text('画布已重新载入，书写内容完整保留'), findsOneWidget);
+      reloadCanvas();
+      State? stateAfterRestart;
+      for (var attempt = 0; attempt < 20; attempt++) {
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        final canvasPage = find.byType(HandwritingCanvasPage);
+        if (canvasPage.evaluate().isEmpty ||
+            find
+                .byKey(const ValueKey('handwriting-ink-layer'))
+                .evaluate()
+                .isEmpty) {
+          continue;
+        }
+        final candidate = tester.state(canvasPage);
+        if (!identical(candidate, stateBeforeRestart)) {
+          stateAfterRestart = candidate;
+          break;
+        }
+      }
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(
+        find.text('画布已重新启动，当前位置和书写内容完整保留'),
+        findsOneWidget,
+      );
+      expect(stateAfterRestart, isNotNull);
+      expect(identical(stateAfterRestart, stateBeforeRestart), isFalse);
       final reloadedInkLayer = tester.widget<CustomPaint>(
         find.byKey(const ValueKey('handwriting-ink-layer')),
       );
       final dynamic reloadedInkPainter = reloadedInkLayer.painter;
       expect((reloadedInkPainter.strokes as List), hasLength(3));
+      expect(reloadedInkPainter.offset, offsetBeforeRestart);
+      expect(reloadedInkPainter.scale, scaleBeforeRestart);
 
       await tester.tap(find.byKey(const ValueKey('canvas-reset-current')));
       await tester.pumpAndSettle();
